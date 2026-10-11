@@ -181,24 +181,151 @@ cargo tauri build
 
 > 实话：这一项**和选 Tauri 还是 pywebview 完全无关**。任何未签名的分发形态都会遇到。
 
-### 3.3 首次运行引导
+### 3.3 首次运行引导 —— 已实现
 
-用户装完打开时，`~/.nanobot/config.json` 还不存在。当前实现会直接失败并提示
-「还没有配置文件」。发布前需要改成**引导流程**：
+原问题：用户装完打开时 `~/.nanobot/config.json` 还不存在，直接报错。
 
-1. 检测配置不存在 → 显示内置的设置页（而不是错误）
-2. 让用户填 provider 与 API key
-3. 写入 `config.json`，再走正常引导
+**实现方式（已在代码里）**：不自己手搓 `config.json`（那等于复制上游 schema
+与校验规则，早晚漂移），而是调用上游 `nanobot webui --yes --no-open`
+走官方初始化路径。它会生成 schema 正确的配置、启用本地 WebUI 通道、
+把 `tokenIssueSecret` 写进去，然后拉起网关。
 
-上游的 WebUI 本身就能做这件事（未配置模型时它会展示设置界面），所以更省事的做法是：
-**首次运行时用一份最小配置启动网关**（`--yes` 等价的安全默认值），
-然后让用户在 WebUI 里配置。这样不用自己写引导 UI。
+两个必须遵守的顺序约束（写反都会失败）：
 
-### 3.4 单实例
+1. **先起网关、再读配置** —— 首次运行时配置文件是**网关写出来的**。
+2. **初始化后重新读一次配置** —— `tokenIssueSecret` 是那次才生成的，
+   用占位默认值开窗会连不上后端。
 
-用户可能双击两次。需要单实例锁，否则第二个实例会：
-探测到端口已监听 → 附着 → 开出第二个窗口，两个窗口共用同一网关。
-行为不算错，但观感差。用 Tauri 的单实例插件处理。
+实测：1.6s 生成配置、4.3s 网关就绪。首次运行生成的配置里**没有任何 provider
+key**，所以引导文案提示「随后请在 Settings → Models 里配置模型」是必要且准确的。
+
+### 3.4 单实例 —— 已实现
+
+第二个实例会探测到端口被监听（那正是第一个实例起的网关）→ 判定「附着」→
+开出第二个窗口，两个窗口共用同一网关。
+
+**用命名互斥体（`CreateMutexW`）而不是 Tauri 单实例插件、更不是锁文件**：
+锁文件的经典故障是「崩溃后永远起不来」（残留陈旧锁）；
+命名互斥体由内核在进程退出时自动释放，崩溃也不会残留。
+
+---
+
+## 第四部分：卸载残留与界面语言
+
+### 4.1 Tauri 默认的「删除应用程序数据」删不干净 nanobot
+
+Tauri 的 NSIS 模板**已经内置**「删除应用程序数据」复选框，但它删的是：
+
+```
+RmDir /r "$APPDATA\${BUNDLEID}"        → %APPDATA%\com.snapbot.desktop
+RmDir /r "$LOCALAPPDATA\${BUNDLEID}"   → %LOCALAPPDATA%\com.snapbot.desktop
+```
+
+而 nanobot 把**全部用户数据**放在 `~/.nanobot`（Python `Path.home()`，
+Windows 上即 `%USERPROFILE%`），**根本不在上面两个路径里**：
+
+| 路径 | 内容 |
+|---|---|
+| `%USERPROFILE%\.nanobot\config.json` | **含 API key** |
+| `%USERPROFILE%\.nanobot\workspace\` | 工作区与记忆 |
+| `%USERPROFILE%\.nanobot\sessions\` | 会话历史 |
+| `%USERPROFILE%\.nanobot\logs\` | 日志（含桌面壳日志） |
+| `%USERPROFILE%\.nanobot\run\` | 网关状态 |
+| `%USERPROFILE%\.nanobot\llm_usage.sqlite3` | 用量统计 |
+
+而且 `.nanobot` 以点开头、资源管理器里默认隐藏，用户很难自己发现。
+**这就是「卸载留残留」的真正来源。**
+
+### 4.2 解决办法：installer hooks
+
+```json
+{
+  "bundle": {
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "installerHooks": "installer-hooks.nsh",
+        "installMode": "currentUser"
+      }
+    }
+  }
+}
+```
+
+`desktop/src-tauri/installer-hooks.nsh` 挂两个宏：
+
+- **`NSIS_HOOK_PREUNINSTALL`**
+  - `StrCpy $DeleteAppDataCheckboxState 1` —— 默认按「已勾选删除数据」处理
+  - 停掉后端进程树（`taskkill /T`）；否则文件被占用会删不干净
+  - 顺带清理开发形态遗留的 `nanobot gateway --background` 进程
+- **`NSIS_HOOK_POSTUNINSTALL`**
+  - 逐项 `RmDir /r` 删 `$PROFILE\.nanobot` 下的子目录，最后整体再删一次
+  - **必须判断 `$UpdateMode <> 1`**：升级覆盖安装时绝不能删用户数据
+
+三个关键实现细节：
+
+1. **宏在卸载器上下文里执行**，其中调用的自定义函数必须命名为 `un.xxx`。
+   写错会得到 NSIS 编译错误或在运行时找不到函数。
+2. **无法回头去点那个复选框**：它由模板的 `un.ConfirmPagePre` 创建，
+   勾选状态在 `un.ConfirmLeave` 读入 `$DeleteAppDataCheckboxState`。
+   但该变量在页面创建时已声明（`Var`），在 PREUNINSTALL 里直接写它
+   即等价于「用户勾选了」。这比替换整个 NSIS 模板去挂
+   `MUI_PAGE_CUSTOMFUNCTION_PRE` 可靠得多。
+3. **逐项删除而不是只 `RmDir /r` 整个目录**：万一有文件被占用导致整体删除
+   失败，逐项删至少能保住大部分清理效果，而不是全军覆没。
+
+### 4.3 明确不删的东西
+
+- **开发形态的源码检出**（如 `D:\Desktop\SnapBot\nanobot-0.3.5`）**不删**。
+  那是用户的源码，删掉属越权。安装程序只清理本产品自己创建的数据。
+- 安装目录由 Tauri 模板自己处理，hooks 不重复插手。
+
+### 4.4 安装程序界面语言
+
+`"languages": ["SimpChinese", "English"]` + `displayLanguageSelector: false`：
+按系统语言自动选，中文系统即中文界面，不弹语言选择框。
+
+中文语言包（`SimpChinese.nsh`，随 `tauri-bundler` 分发）**已包含**自定义文案的
+翻译，包括那个复选框的 `deleteAppData` → **"删除应用程序数据"**，
+所以不需要 `customLanguageFiles` 补翻译。
+
+### 4.5 应用界面语言（注意：这不是安装程序语言）
+
+上游 `webui/src/i18n/config.ts` 的 `resolveInitialLocale()` **只读 localStorage，
+完全不看系统语言**：
+
+```ts
+export const defaultLocale: SupportedLocale = "en";
+export function resolveInitialLocale() {
+  return readStoredLocale() ?? defaultLocale;   // ← 没有 navigator.language 兜底
+}
+```
+
+所以中文用户首次打开必然是英文界面——**即使 `zh-CN` 语言包已经打包在 `dist` 里**。
+
+**解决办法：注入初始化脚本，不 fork 上游。** Tauri 的
+`WebviewWindowBuilder::initialization_script()` 在页面自身脚本之前执行，
+因此 i18n 模块初始化时，localStorage 里已经有我们写入的值：
+
+```rust
+const FORCE_CHINESE_LOCALE_SCRIPT: &str = r#"
+(function () {
+  try { window.localStorage.setItem('nanobot.locale', 'zh-CN'); } catch (e) {}
+})();
+"#;
+```
+
+三个要点：
+
+1. **无条件写入**（不是「仅当未设置」）——需求是默认中文。用户切换语言后
+   在本次会话内生效，重启回到中文。
+2. **存储键必须与上游 `LOCALE_STORAGE_KEY` 一致**（`nanobot.locale`）。
+   写错会**静默退回英文**：无异常、无日志。所以有一条单元测试锁住这个约定
+   （`locale_script_writes_the_key_upstream_reads`）。
+3. 脚本会注入 WebView 里的**每一个页面**（含加载页），加载页不受影响。
+
+已用截图实测确认界面为中文。
 
 ---
 
@@ -207,8 +334,20 @@ cargo tauri build
 - [ ] `packaging/backend_entry.py` 的 `-m nanobot` 拦截已实现并**单独测过**
 - [ ] `.spec` 四类资源（web/dist、templates、skills、channels/*/webui）都能收集到
 - [ ] onedir 形态，且确认杀掉 exe 后 Python 子进程不残留
-- [ ] 全新用户环境测试：删掉 `~/.nanobot` 后首次运行能走通引导
-- [ ] 端口被别的程序占用时（不是网关）不会误判为「已在运行」
+- [x] 端口被别的程序占用时（不是网关）不会误判为「已在运行」
+      → 已改为校验 `/health` 响应体
+- [x] 全新用户环境测试：删掉 `~/.nanobot` 后首次运行能走通引导
+      → 已实测（1.6s 生成配置、4.3s 就绪）
+- [x] 应用界面默认简体中文 → 已用截图实测确认
+- [ ] **卸载残留验证**：装完整包 → 用一次（产生 config.json / sessions / logs）
+      → 卸载 → 确认 `%USERPROFILE%\.nanobot` 整个消失
+- [ ] **升级不误删数据验证**：装 v1 → 用一次 → 覆盖安装 v2
+      → 确认 `$UpdateMode = 1` 分支生效、用户数据仍在
+- [ ] 卸载时若网关正在运行，确认进程被停掉且数据仍能删净
+- [ ] 安装程序界面为中文（中文系统下）
 - [ ] 安装到含中文/空格的路径下能正常工作
 - [ ] WebView2 缺失场景已按选定模式处理
 - [ ] 签名与 SmartScreen 表现已实测
+
+> 前两条（卸载残留、升级不误删）是**必须实测**的：它们都只在打包产物上才能验证，
+> 而 hooks 一旦写错（比如漏了 `$UpdateMode` 判断），后果是用户升级一次就丢光数据。

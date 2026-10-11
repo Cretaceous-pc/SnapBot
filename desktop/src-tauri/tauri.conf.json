@@ -25,6 +25,14 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "shortDescription": "nanobot 桌面客户端",
-    "longDescription": "把 nanobot 包装成自带窗口的 Windows 桌面应用，无需浏览器与命令行。"
+    "longDescription": "把 nanobot 包装成自带窗口的 Windows 桌面应用，无需浏览器与命令行。",
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "installerHooks": "installer-hooks.nsh",
+        "installMode": "currentUser"
+      }
+    }
   }
 }

@@ -171,6 +171,41 @@ fn run_bootstrap(app: tauri::AppHandle) {
     gateway::log_line("引导完成，WebView 即将导航到 WebUI");
 }
 
+/// 强制 WebUI 默认语言为简体中文。
+///
+/// 为什么需要注入而不改上游源码：上游 `webui/src/i18n/config.ts` 的
+/// `resolveInitialLocale()` **只读 localStorage，完全不看系统语言**，
+/// 所以中文用户首次打开必然是英文界面（`defaultLocale` 硬编码为 "en"）。
+///
+/// 注入点是 `initialization_script`：它在页面自身脚本之前执行，
+/// 因此 i18n 模块初始化时读到的就已经是我们写入的值。
+///
+/// 这里**刻意无条件写入**（不是"仅当未设置"）：需求是默认中文，
+/// 无条件写可保证每次启动都回到中文。用户在界面里切换语言后，
+/// 那次切换在本次会话内生效，重启后回到中文。
+///
+/// 存储键必须与上游 `LOCALE_STORAGE_KEY` 一致：`nanobot.locale`。
+const FORCE_CHINESE_LOCALE_SCRIPT: &str = r#"
+(function () {
+  try {
+    window.localStorage.setItem('nanobot.locale', 'zh-CN');
+  } catch (e) {
+    /* localStorage 不可用时交给上游走它自己的默认值 */
+  }
+})();
+"#;
+
+/// 上游 `webui/src/i18n/config.ts` 里定义的语言存储键。
+/// 单独抽出来是为了让测试能断言注入脚本与上游约定一致——
+/// 这个键一改，语言就会静默退回英文，而且没有任何报错。
+#[cfg_attr(not(test), allow(dead_code))]
+const UPSTREAM_LOCALE_STORAGE_KEY: &str = "nanobot.locale";
+
+/// 构造注入脚本。抽成函数便于测试。
+fn locale_script() -> String {
+    FORCE_CHINESE_LOCALE_SCRIPT.to_string()
+}
+
 fn main() {
     // 单实例：第二个实例直接退出，避免开出两个窗口共用同一网关
     if !single_instance::acquire() {
@@ -188,6 +223,7 @@ fn main() {
                 .title("SnapBot")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(900.0, 600.0)
+                .initialization_script(locale_script())
                 .build()?;
             gateway::log_line("窗口已创建，开始在后台引导网关");
 
@@ -208,4 +244,38 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注入脚本必须写上游真正读取的那个 localStorage 键。
+    ///
+    /// 这个断言比它看起来重要：如果上游改了 `LOCALE_STORAGE_KEY`
+    /// （或我们把它写错），界面会**静默退回英文**——没有异常、没有日志，
+    /// 只有肉眼看界面才能发现。这条测试把"静默失败"变成"编译期可见的失败"。
+    #[test]
+    fn locale_script_writes_the_key_upstream_reads() {
+        let script = locale_script();
+        let expected = format!("'{UPSTREAM_LOCALE_STORAGE_KEY}'");
+        assert!(
+            script.contains(&expected),
+            "注入脚本必须写入 {UPSTREAM_LOCALE_STORAGE_KEY}，实际脚本：{script}"
+        );
+    }
+
+    #[test]
+    fn locale_script_defaults_to_simplified_chinese() {
+        assert!(locale_script().contains("'zh-CN'"));
+    }
+
+    /// 必须用 setItem（覆盖写）而不是"仅当不存在时才写"，
+    /// 否则用户切到英文后重启仍是英文，不符合"默认中文"的要求。
+    #[test]
+    fn locale_script_overwrites_rather_than_conditionally_sets() {
+        let script = locale_script();
+        assert!(script.contains("setItem"));
+        assert!(!script.contains("getItem"));
+    }
 }

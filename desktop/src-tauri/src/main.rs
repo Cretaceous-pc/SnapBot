@@ -122,7 +122,7 @@ fn run_bootstrap(app: tauri::AppHandle) {
         Ok(gateway::GatewayState::Spawned(mut process)) => {
             gateway::log_line(&format!(
                 "网关已启动（解释器 {}）",
-                process.python_path().display()
+                process.backend_path().display()
             ));
             gateway::drain_output(&mut process);
             *boot.process.lock().unwrap() = Some(process);

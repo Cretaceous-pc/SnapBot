@@ -22,6 +22,18 @@ SnapBot_0.1.0_x64-setup.exe          ← 一个安装程序，用户双击装完
 
 ## 第一部分：把 Python 后端冻成 sidecar
 
+> **状态：已实施并实测通过。** 见 [`../packaging/`](../packaging/)：
+> `backend_entry.py`、`snapbot-backend.spec`、`build-backend.ps1`。
+>
+> 实测结果：产物 **120.7 MB**，冻结 exe 注册 **23 个工具**（与开发形态逐一相同）、
+> 启用 websocket 渠道、`/health` 返回 `websocket: running`；
+> 桌面壳指向冻结后端时 WebView 正常连上并渲染中文界面。
+
+```powershell
+# 构建（含冒烟测试：CLI 启动 + 起网关 + /health 就绪）
+.\packaging\build-backend.ps1 -Clean
+```
+
 ### 1.1 必须先解决的：`sys.executable` 自举陷阱
 
 上游拉起网关子进程的方式（`nanobot/gateway/runtime.py:107`）：
@@ -37,66 +49,76 @@ SnapBot_0.1.0_x64-setup.exe          ← 一个安装程序，用户双击装完
 nanobot-backend.exe -m nanobot gateway --foreground --port 18790
 ```
 
-**`-m` 对冻结的 exe 没有意义，必然失败。** 必须在入口最前面拦截：
+**`-m` 对冻结的 exe 没有意义，必然失败。** 已在 `packaging/backend_entry.py`
+入口最前面拦截这个精确 argv 前缀并转发给 nanobot 的 CLI main。实测有效。
+
+### 1.2 最大的坑：`pkgutil` 枚举失效导致渠道与工具**静默消失**
+
+上游用 `pkgutil.iter_modules(package.__path__)` 动态枚举包：
+
+- `nanobot/channels/registry.py:25` —— 枚举渠道
+- `nanobot/agent/tools/loader.py:43` —— 枚举工具
+
+冻结后 `__path__` 指向 PYZ 归档内部，而 `iter_modules` 需要扫描**真实文件系统目录**，
+于是什么都枚举不到。症状极具误导性：
+
+- 进程正常启动、`/health` 返回 `ready: true` —— 看起来一切正常
+- 但日志里只有一行 WARNING：`No channels enabled`
+- WebUI 打不开（websocket 渠道没起来），工具全部消失
+- **没有任何异常或 traceback**
+
+**关键区分**：`hiddenimports` / `collect_submodules` 只保证模块「**可导入**」，
+**不解决「可枚举」**。这是最容易误判的地方——以为收了子模块就够了。
+
+正确修法是在 spec 的 `Analysis` 里用 `module_collection_mode` 把包从归档里
+拿出来、作为散装文件落地：
 
 ```python
-# packaging/backend_entry.py
-import sys
-
-def main() -> int:
-    # 冻结后上游会用 `<exe> -m nanobot ...` 自举，转成正常 CLI 调用
-    if sys.argv[1:3] == ["-m", "nanobot"]:
-        sys.argv = [sys.argv[0], *sys.argv[3:]]
-        from nanobot.cli.entry import main as nanobot_main
-        nanobot_main()
-        return 0
-    # 直接运行（桌面壳拉起我们）
-    from nanobot.cli.entry import main as nanobot_main
-    nanobot_main()
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+module_collection_mode={
+    "nanobot.channels": "py+pyz",
+    "nanobot.agent.tools": "py+pyz",
+},
 ```
 
-> 另有一条更彻底的路：**冻结时不用上游的 CLI 自举**，而是让桌面壳直接把
-> `--foreground` 网关跑在同一个进程里（`nanobot.gateway` 的 asyncio 入口）。
-> 少一层进程、少一个坑，但会失去上游的租约/看门狗保护。当前选择拦截法。
+合法取值：`'pyz'`(默认) / `'pyc'` / `'py'` / `'pyz+py'`。选 `'py+pyz'` 是两头都要：
+归档里留一份（导入快），磁盘上留一份（可枚举）。
 
-### 1.2 PyInstaller 必须显式打包的资源
+**验证方法**：对比冻结形态与开发形态的**工具注册数与渠道列表**，
+而不是只看「进程起来了 / health 返回 ok」——后者在渠道为 0 时同样成立。
 
-`pyproject.toml` 的 `include` / `artifacts` 声明了这些非 `.py` 文件，PyInstaller
-**不会自动收集**，漏了会以各种诡异方式失败：
+### 1.3 其余必须显式打包的资源
 
 | 资源 | 漏掉的症状 |
 |---|---|
-| `nanobot/web/dist/**` | 窗口打开是白屏（前端产物 6.17MB / 438 文件） |
-| `nanobot/templates/**/*.md` | 首次运行不生成 `AGENTS.md` / `SOUL.md` / `USER.md` / `HEARTBEAT.md` |
-| `nanobot/skills/**/*.md`、`**/*.sh` | 技能系统空掉 |
-| `nanobot/channels/*/webui/**` | 部分渠道的设置面板加载失败 |
+| `nanobot/web/dist/**` | 白屏（前端产物 6.17MB / 438 文件） |
+| `nanobot/templates/**/*.md` | 首次运行不生成 `AGENTS.md` / `SOUL.md` / `USER.md` |
+| `nanobot/skills/**/*.md` | 技能系统空掉 |
+| `nanobot/channels/*/webui/**` | 部分渠道设置面板加载失败 |
 
-`.spec` 片段：
+> 属性访问式 `datas` **必须用 `(src, dest)` 元组**。写成列表会被当成字符串序列，
+> 生成出逐字符的垃圾目录。
 
-```python
-datas = [
-    ("../nanobot-0.3.5/nanobot/web/dist", "nanobot/web/dist"),
-    ("../nanobot-0.3.5/nanobot/templates", "nanobot/templates"),
-    ("../nanobot-0.3.5/nanobot/skills", "nanobot/skills"),
-]
-# 渠道 webui 目录逐个收集
-for p in Path("../nanobot-0.3.5/nanobot/channels").glob("*/webui"):
-    datas.append((str(p), f"nanobot/channels/{p.parent.name}/webui"))
-```
+同时过滤掉 `collect_submodules` 收进来的测试包（`.tests` / `test_`），
+否则产物里会塞进每个渠道的整套测试。
 
-### 1.3 用 onedir，不要 onefile
+### 1.4 用 onedir，不要 onefile
 
-| | onefile | **onedir（选这个）** |
+| | onefile | **onedir（已选）** |
 |---|---|---|
 | 杀软误报 | 高（自解压行为） | 低 |
 | 启动速度 | 每次解压到 temp，慢 | 直接加载 |
-| 分发 | 单文件好看 | 一个目录，但由安装程序封装，用户无感 |
+| 分发 | 单文件好看 | 一个目录，由安装程序封装，用户无感 |
 
-### 1.4 运行时数据绝不能打进包
+### 1.5 构建脚本的两个 PowerShell 坑
+
+1. **脚本必须纯 ASCII**。Windows PowerShell 5.1 在没有 BOM 时按 ANSI/GBK
+   读取 `.ps1`，中文会把字符串字面量甚至**行继续符反引号**弄坏，
+   报出指向错误行号的诡异解析错误（本次实测：`无法将参数绑定到参数"Path"，因为该参数是空值`）。
+2. **PyInstaller 把进度写到 stderr**，在 `$ErrorActionPreference='Stop'` 下
+   会被包装成 NativeCommandError 并**终止脚本**，表现为「构建莫名跑到一半退出」。
+   脚本里临时放宽该设置、自行接管两个输出流、只看退出码。
+
+### 1.6 运行时数据绝不能打进包
 
 | 路径 | 必须在用户目录 |
 |---|---|
@@ -107,33 +129,48 @@ for p in Path("../nanobot-0.3.5/nanobot/channels").glob("*/webui"):
 
 打进包的后果：升级覆盖用户数据；装到 `Program Files` 下默认不可写，直接起不来。
 
+> 另注：**上游没有 `NANOBOT_DATA_DIR` 之类的环境变量**。数据目录由
+> `set_config_path()` 决定，等于 config 文件的**父目录**
+> （`nanobot/config/paths.py`）。做隔离测试要用 `--config` 指向临时目录，
+> 不要指望环境变量。
+
 ---
 
 ## 第二部分：Tauri 侧
 
-### 2.1 sidecar 声明
+### 2.1 冻结产物的挂载方式
 
-`tauri.conf.json`：
+用 `bundle.resources` 而不是 `externalBin`：
 
 ```json
 {
   "bundle": {
-    "externalBin": ["binaries/nanobot-backend"],
-    "resources": ["binaries/backend/**"]
+    "resources": {
+      "../../packaging/dist/nanobot-backend": "nanobot-backend"
+    }
   }
 }
 ```
 
-`externalBin` 要求文件名带 target triple，例如
-`binaries/nanobot-backend-x86_64-pc-windows-msvc.exe`。
+**为什么不选 `externalBin`**：Tauri 的 sidecar 机制预期单个可执行文件，
+而 PyInstaller 的 onedir 是一个含 `_internal/` 的目录树。
+`resources` 按目录整体搬运，语义正好。
+（代价：失去 Tauri 的 sidecar 自动命名/校验，但我们本来就要自己管进程。）
 
-> ⚠️ **待定**：当前 `gateway.rs::resolve_python()` 是自己找解释器并
-> `python -m nanobot gateway`。切到 sidecar 后要改成直接执行
-> `nanobot-backend.exe gateway --foreground --port ...`，
-> 并把 `resolve_python()` 换成 `resolve_backend()`。
-> 两处都要改，不要只改一处。
+运行时由 `gateway::resolve_backend()` 依次查找：
+显式覆盖 `SNAPBOT_BACKEND` → 冻结产物（程序同级 / `resources/nanobot-backend/`）
+→ 开发形态的 `.venv`。
 
-### 2.2 WebView2 运行时
+### 2.2 命令行形态差异（容易出错）
+
+| 形态 | 命令行 |
+|---|---|
+| 冻结 | `nanobot-backend.exe gateway --foreground --port 18790` |
+| 开发 | `python.exe -m nanobot gateway --foreground --port 18790` |
+
+这个差异集中在 `BackendRuntime::command()` 一处，调用方只传 nanobot 自己的参数。
+
+### 2.3 WebView2 运行时
 
 Win11 自带；Win10 不一定有。Tauri 的选项：
 

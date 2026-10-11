@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "SnapBot 桌面壳需要的最小权限集",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

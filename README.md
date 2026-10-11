@@ -51,10 +51,11 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 仓库初始化、分支策略确立 → [`docs/git-conventions.md`](docs/git-conventions.md)
 - [x] Tauri 壳骨架：起网关 → 等就绪 → 开窗 → 退出回收
       → [`desktop/README.md`](desktop/README.md)
-- [x] 开发期直连现有 `.venv`（**两条路径已实测**：附着已有网关 / 自行拉起并回收）
+- [x] 开发期直连现有 `.venv`（**三条路径已实测**：附着已有网关 / 自行拉起并回收 / 首次运行引导）
+- [x] 首次运行引导：无配置时走上游初始化路径（实测 1.6s 生成配置、4.3s 网关就绪）
+- [x] 单实例锁（命名互斥体）、加载页进度与失败重试、日志落地 `~/.nanobot/logs/desktop.log`
 - [ ] PyInstaller 冻结 Python 后端为 sidecar → [`docs/packaging.md`](docs/packaging.md)
-- [ ] 首次运行引导（配置不存在时不能直接报错）
-- [ ] 单实例锁、托盘图标、日志落地
+- [ ] 托盘图标、端口被占时自动换端口
 - [ ] 安装程序（NSIS/MSI）+ WebView2 分发策略
 - [ ] 代码签名与分发
 

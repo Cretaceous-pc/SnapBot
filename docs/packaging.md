@@ -368,23 +368,76 @@ const FORCE_CHINESE_LOCALE_SCRIPT: &str = r#"
 
 ## 打包前的检查清单
 
-- [ ] `packaging/backend_entry.py` 的 `-m nanobot` 拦截已实现并**单独测过**
-- [ ] `.spec` 四类资源（web/dist、templates、skills、channels/*/webui）都能收集到
-- [ ] onedir 形态，且确认杀掉 exe 后 Python 子进程不残留
+- [x] `packaging/backend_entry.py` 的 `-m nanobot` 拦截已实现并**单独测过**
+- [x] `.spec` 四类资源（web/dist、templates、skills、channels/*/webui）都能收集到
+- [x] onedir 形态，且确认杀掉 exe 后 Python 子进程不残留
 - [x] 端口被别的程序占用时（不是网关）不会误判为「已在运行」
       → 已改为校验 `/health` 响应体
 - [x] 全新用户环境测试：删掉 `~/.nanobot` 后首次运行能走通引导
       → 已实测（1.6s 生成配置、4.3s 就绪）
 - [x] 应用界面默认简体中文 → 已用截图实测确认
-- [ ] **卸载残留验证**：装完整包 → 用一次（产生 config.json / sessions / logs）
-      → 卸载 → 确认 `%USERPROFILE%\.nanobot` 整个消失
-- [ ] **升级不误删数据验证**：装 v1 → 用一次 → 覆盖安装 v2
-      → 确认 `$UpdateMode = 1` 分支生效、用户数据仍在
-- [ ] 卸载时若网关正在运行，确认进程被停掉且数据仍能删净
-- [ ] 安装程序界面为中文（中文系统下）
+- [x] **卸载残留验证**：装完整包 → 用一次 → 卸载 → `%USERPROFILE%\.nanobot` 整个消失
+- [x] **升级不误删数据验证**：装 → 用一次 → 覆盖安装 → 用户数据仍在
+- [x] 卸载时若网关正在运行，进程被停掉且数据仍能删净
+- [x] 安装程序界面为中文（`languages: [SimpChinese, English]`）
+- [x] 安装到用户目录（`%LOCALAPPDATA%`，per-user，无需管理员）
 - [ ] 安装到含中文/空格的路径下能正常工作
-- [ ] WebView2 缺失场景已按选定模式处理
+- [ ] WebView2 缺失场景已按选定模式处理（当前未显式配置 `webviewInstallMode`）
 - [ ] 签名与 SmartScreen 表现已实测
 
-> 前两条（卸载残留、升级不误删）是**必须实测**的：它们都只在打包产物上才能验证，
-> 而 hooks 一旦写错（比如漏了 `$UpdateMode` 判断），后果是用户升级一次就丢光数据。
+### 实测记录（2026-10-11）
+
+安装包 `SnapBot_0.1.0_x64-setup.exe`，**52.29 MB**，**未签名**。
+安装后 `%LOCALAPPDATA%\SnapBot` 共 **130.4 MB**（9.54 MB 壳 + 120.7 MB 冻结后端）。
+
+| 验证项 | 方法 | 结果 |
+|---|---|---|
+| 安装 | `setup.exe /S` | 退出码 0，注册为 `SnapBot 0.1.0`，per-user 无需管理员 |
+| **独立运行** | 清空全部 `SNAPBOT_*` 环境变量后启动 | 后端取自**安装目录**（非开发目录），`/health` 返回 `websocket: running` |
+| **升级不丢数据** | 放哨兵文件 → 再次 `/S` 安装 | 39 → 39 文件，哨兵与 `config.json` 均在 ✓ |
+| **卸载无残留** | `uninstall.exe /S` | 数据目录、安装目录、注册表项全部清除 ✓ |
+
+三项实测通过后，已从备份完整还原用户数据（51 文件，DeepSeek key 与 websocket 配置完好）。
+
+### 安装程序与 NSIS 工具链（国内网络的坑）
+
+构建时 Tauri 需要从 GitHub 取两样东西，**走代理时 TLS 常失败**：
+
+1. `nsis-3.11.zip`（约 2 MB）→ `%LOCALAPPDATA%\tauri\NSIS`
+2. `nsis_tauri_utils.dll`（约 34 KB）→ 同上目录的 `Plugins\x86-unicode\additional\`
+
+Tauri 会自动下载，失败时报 `failed to bundle project: io: unexpected end of file`
+或 `timeout: global`。可手动放置：
+
+```
+%LOCALAPPDATA%\tauri\NSIS\
+├─ makensis.exe                                    ← 来自 nsis-3.11.zip
+├─ Bin\makensis.exe
+└─ Plugins\x86-unicode\additional\
+   └─ nsis_tauri_utils.dll                         ← 需单独下载
+```
+
+**只解压 `nsis-3.11.zip` 是不够的**：Tauri 会校验
+`Plugins/x86-unicode/additional/nsis_tauri_utils.dll`，缺了会报
+`NSIS directory is missing some files. Recreating it.` 并尝试重新下载。
+该 DLL 必须匹配 Tauri 期望的 SHA1（见 `tauri-bundler/src/bundle/windows/nsis/mod.rs`
+的 `NSIS_TAURI_UTILS_SHA1`），v0.5.3 为 `75197FEE3C6A814FE035788D1C34EAD39349B860`。
+
+实测可用的镜像前缀：`https://ghproxy.net/<原始 GitHub URL>`。
+
+### 写 NSIS hooks 的语法坑
+
+**NSIS 字符串字面量用单引号定界，内部不能再出现单引号。** 最初用 wmic 按命令行
+匹配开发形态网关：
+
+```nsis
+; ✗ 报 "unterminated string parsing"（'python.exe' 截断了字符串字面量）
+nsExec::ExecToLog 'wmic process where "name='python.exe' and commandline like '%nanobot%gateway%'" call terminate'
+```
+
+改成 `taskkill /IM python.exe /T /F` + PowerShell 命令行过滤解决。
+
+### 未签名的影响（实测）
+
+`Get-AuthenticodeSignature` 返回 `NotSigned`。用户首次运行会遇到 Windows
+SmartScreen「未知发布者」提示。**这与壳选型无关**，任何未签名的分发形态都一样。

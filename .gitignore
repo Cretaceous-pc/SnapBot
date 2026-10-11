@@ -32,9 +32,16 @@ build/
 .vite/
 *.tsbuildinfo
 
+# 例外：desktop/dist 是**手写的加载页源码**（不是构建产物），必须入库
+!desktop/dist/
+!desktop/dist/**
+
 # ---- Rust / Tauri ----
 /desktop/src-tauri/target/
 /desktop/target/
+# Tauri 构建时自动生成的 ACL schema（每次 tauri-build 都会重写，
+# 入库只会在 Tauri 升级时制造无意义的大 diff）
+/desktop/src-tauri/gen/
 **/*.rs.bk
 Cargo.lock.orig
 

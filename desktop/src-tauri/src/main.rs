@@ -11,6 +11,7 @@
 mod config;
 mod gateway;
 mod single_instance;
+mod tray;
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -112,7 +113,9 @@ fn run_bootstrap(app: tauri::AppHandle) {
     }
 
     // ---- 第二步：确保网关在跑（首次运行会顺带生成配置）----
-    match gateway::ensure_running(&cfg) {
+    let (outcome, plan) = gateway::ensure_running(&cfg);
+
+    match outcome {
         Ok(gateway::GatewayState::Attached) => {
             gateway::log_line("已附着到运行中的网关");
         }
@@ -130,24 +133,13 @@ fn run_bootstrap(app: tauri::AppHandle) {
         }
     }
 
-    // ---- 第三步：现在配置一定存在了，重新读它来算 URL ----
+    // ---- 第三步：算 WebUI 地址 ----
     //
-    // 首次运行后**必须重新读**：tokenIssueSecret 是上游在这次初始化里生成的，
-    // 第一步拿到的只是占位值（secret 为空），用它开窗会连不上后端。
+    // 必须重新读配置，因为首次运行时 tokenIssueSecret 是上游在这次初始化里
+    // 生成的，第一步拿到的只是占位值（secret 为空），用它开窗会连不上后端。
     if cfg.needs_onboarding {
         match config::load() {
-            Ok(fresh) => {
-                cfg = fresh;
-                gateway::log_line(&format!(
-                    "首次运行完成：WebUI 端口 {}，凭据 {}",
-                    cfg.webui_port,
-                    if cfg.secret.is_empty() {
-                        "未设置（依赖 localhost 判定）"
-                    } else {
-                        "已生成"
-                    }
-                ));
-            }
+            Ok(fresh) => cfg = fresh,
             Err(err) => {
                 boot.set_failed(format!(
                     "网关已启动，但重新读取配置失败：{err}\n\
@@ -156,7 +148,26 @@ fn run_bootstrap(app: tauri::AppHandle) {
                 return;
             }
         }
+        gateway::log_line(&format!(
+            "首次运行完成：WebUI 端口 {}，凭据 {}",
+            plan.webui,
+            if cfg.secret.is_empty() {
+                "未设置（依赖 localhost 判定）"
+            } else {
+                "已生成"
+            }
+        ));
     }
+
+    // **用实际端口覆盖配置读到的值**。
+    // 端口回退只体现在临时覆盖文件里，不会改写用户的 config.json，
+    // 所以 config::load() 拿到的仍是原始端口——不覆盖的话 WebView 会去连
+    // 一个根本不是我们网关的端口（实测踩到过：网关在 8766，界面却连 8765）。
+    cfg.health_port = plan.health;
+    cfg.webui_port = plan.webui;
+
+    // 记下实际端口，供下次启动探测（否则会在回退端口上错过正在运行的网关）
+    gateway::remember_ports(&plan);
 
     if !cfg.websocket_enabled {
         boot.set_failed(
@@ -218,22 +229,67 @@ fn main() {
         .invoke_handler(tauri::generate_handler![bootstrap_status, bootstrap_retry])
         .setup(|app| {
             gateway::log_line("=== SnapBot 桌面壳启动 ===");
+
+            let handle = app.handle().clone();
+
+            // 托盘建不起来不该让整个应用起不来（例如某些精简版 Windows shell）
+            match tray::build(&handle) {
+                Ok(()) => gateway::log_line("托盘图标已创建；关闭窗口将隐藏到托盘，退出请用托盘菜单"),
+                Err(err) => {
+                    gateway::log_line(&format!("托盘图标创建失败（不影响主功能）: {err}"))
+                }
+            }
+
             let url: Url = "tauri://localhost/".parse()?;
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url))
+            let window = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(url))
                 .title("SnapBot")
                 .inner_size(1280.0, 860.0)
                 .min_inner_size(900.0, 600.0)
                 .initialization_script(locale_script())
                 .build()?;
+
+            // 关窗 = 隐藏到托盘。挂在窗口上（on_window_event 不在 AppHandle 上）
+            let inner = window.as_ref().window();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    tray::handle_close_request(&inner, api);
+                }
+            });
+
             gateway::log_line("窗口已创建，开始在后台引导网关");
 
-            let handle = app.handle().clone();
+            // 仅调试构建：用于自动化验证「托盘退出」这条路径。
+            // 托盘菜单点击无法从外部脚本可靠触发，但那条路径串起了
+            // ExitRequested 放行 + Exit 清理网关两个关键行为，值得可测。
+            #[cfg(debug_assertions)]
+            if let Ok(ms) = std::env::var("SNAPBOT_DEBUG_AUTOQUIT_MS") {
+                if let Ok(ms) = ms.parse::<u64>() {
+                    let quit_handle = handle.clone();
+                    gateway::log_line(&format!("[调试] {ms} ms 后自动退出"));
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                        tray::request_quit(&quit_handle);
+                    });
+                }
+            }
+
             std::thread::spawn(move || run_bootstrap(handle));
             Ok(())
         })        .build(tauri::generate_context!())
         .expect("Tauri 应用初始化失败")
-        .run(|app, event| {
-            if let RunEvent::ExitRequested { .. } = event {
+        .run(|app, event| match event {
+            // 窗口关掉不等于要退出：拦住，让网关继续在后台服务。
+            // 注意 Tauri 在**最后一个窗口关闭时**默认会真的退出，所以这一拦是必需的。
+            // 托盘「退出」会先置位 QUIT_REQUESTED，这里的判断因而放行。
+            RunEvent::ExitRequested { api, .. } => {
+                if !tray::is_quit_requested() {
+                    api.prevent_exit();
+                }
+            }
+            // 真正退出：进程即将结束，必须清理网关。
+            // 原实现在 ExitRequested 里清理，但那个事件现在会被 prevent_exit 拦下，
+            // 所以清理必须挪到 Exit —— Exit 在任何退出路径上都会触发一次。
+            RunEvent::Exit => {
                 if let Some(state) = app.try_state::<Bootstrap>() {
                     if let Some(mut process) = state.process.lock().unwrap().take() {
                         gateway::log_line("停止由本应用启动的网关");
@@ -242,7 +298,11 @@ fn main() {
                         gateway::log_line("网关非本应用启动，退出时保持运行");
                     }
                 }
+                // 状态文件只在"本应用正跑着"时有意义，退出即清掉，
+                // 避免下次启动拿一份过期端口去做探测。
+                gateway::forget_ports();
             }
+            _ => {}
         });
 }
 

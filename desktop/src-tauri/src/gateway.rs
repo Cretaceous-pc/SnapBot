@@ -35,16 +35,51 @@ pub enum GatewayState {
     /// 复用已在运行的实例，退出时**不动它**
     Attached,
 }
+
+/// 后端形态。决定命令行怎么拼 —— 这是冻结后**最容易出错**的一处。
+pub enum BackendRuntime {
+    /// 冻结产物：单文件 exe，直接用子命令，不能带 `-m nanobot`
+    Frozen(PathBuf),
+    /// 开发形态：需要 `python -m nanobot`
+    Python(PathBuf),
+}
+
+impl BackendRuntime {
+    fn program(&self) -> &Path {
+        match self {
+            BackendRuntime::Frozen(path) | BackendRuntime::Python(path) => path,
+        }
+    }
+
+    /// 是否为冻结形态（写日志用）。
+    fn is_frozen(&self) -> bool {
+        matches!(self, BackendRuntime::Frozen(_))
+    }
+
+    /// 把 nanobot 的参数翻译成这个形态可用的完整命令行。
+    ///
+    /// 冻结形态直接 `nanobot-backend.exe gateway --foreground ...`；
+    /// 开发形态要 `python.exe -m nanobot gateway --foreground ...`。
+    fn command(&self, args: &[String]) -> Command {
+        let mut cmd = Command::new(self.program());
+        if matches!(self, BackendRuntime::Python(_)) {
+            cmd.arg("-m").arg("nanobot");
+        }
+        cmd.args(args);
+        cmd
+    }
+}
+
 pub struct GatewayProcess {
     child: Child,
-    /// 记录实际使用的解释器，排障时第一眼要看的东西
-    python: PathBuf,
+    /// 记录实际使用的后端路径，排障时第一眼要看的东西
+    backend: PathBuf,
 }
 
 impl GatewayProcess {
-    /// 实际使用的 Python 解释器路径（写日志/展示用）。
-    pub fn python_path(&self) -> &Path {
-        &self.python
+    /// 实际使用的后端路径（写日志/展示用）。
+    pub fn backend_path(&self) -> &Path {
+        &self.backend
     }
 
     /// 请求停止并等待退出；超时则强杀。
@@ -74,58 +109,79 @@ impl GatewayProcess {
 
 // ---------------------------------------------------------------- 定位解释器
 
-/// 定位 Python 解释器。
+/// 定位后端可执行文件。两种形态：
 ///
-/// 顺序有意为之：
-///   1. `SNAPBOT_PYTHON` —— 开发期与排障用的显式覆盖
-///   2. 冻结打包的 sidecar（发布形态，自包含，最优先）
-///   3. 上游开发检出里的 `.venv`
-pub fn resolve_python() -> Result<PathBuf, String> {
-    if let Some(explicit) = std::env::var_os("SNAPBOT_PYTHON") {
+///   1. **冻结形态**：随 Tauri `resources` 打包的 `nanobot-backend.exe`。
+///      这是发布形态 —— 用户机器上没有 Python，也不该有。
+///   2. **开发形态**：上游检出里的 `.venv\Scripts\python.exe`。
+///
+/// 顺序有意为之：先找冻结后端（自包含、最快），再回落到开发检出。
+/// `SNAPBOT_BACKEND` 可用于显式覆盖，便于排障。
+///
+/// 接收 `cfg` 是为了让开发形态也能用到「配置所在的数据目录」这一线索；
+/// 当前实现按仓库相对路径查找，参数保留以便后续支持便携式布局。
+pub fn resolve_backend(_cfg: &GatewayConfig) -> Result<BackendRuntime, String> {
+    if let Some(explicit) = std::env::var_os("SNAPBOT_BACKEND") {
         let path = PathBuf::from(explicit);
         if path.is_file() {
-            return Ok(path);
+            return Ok(BackendRuntime::Frozen(path));
         }
-        return Err(format!("SNAPBOT_PYTHON 指向的文件不存在: {}", path.display()));
+        return Err(format!("SNAPBOT_BACKEND 指向的文件不存在: {}", path.display()));
     }
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
+    // 1) 冻结后端：与主程序同级、或打包后的 resources 目录
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("nanobot-backend.exe"));
-            candidates.push(dir.join("backend").join("nanobot-backend.exe"));
+            let candidates = [
+                dir.join(BACKEND_EXE),
+                dir.join("nanobot-backend").join(BACKEND_EXE),
+                dir.join("resources").join("nanobot-backend").join(BACKEND_EXE),
+                dir.join("resources").join(BACKEND_EXE),
+            ];
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return Ok(BackendRuntime::Frozen(candidate));
+                }
+            }
         }
     }
 
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from);
-    if let Some(root) = workspace {
-        candidates.push(
+    // 2) 开发形态：上游检出的 venv
+    let mut dev: Vec<PathBuf> = Vec::new();
+    if let Some(root) = workspace_root() {
+        dev.push(
             root.join("nanobot-0.3.5")
                 .join(".venv")
                 .join("Scripts")
                 .join("python.exe"),
         );
     }
-
-    for candidate in &candidates {
+    for candidate in &dev {
         if candidate.is_file() {
-            return Ok(candidate.clone());
+            return Ok(BackendRuntime::Python(candidate.clone()));
         }
     }
 
     Err(format!(
-        "找不到 Python 解释器。已尝试：\n{}\n\
-         开发期请设置 SNAPBOT_PYTHON 指向 nanobot 的 venv python.exe。",
-        candidates
-            .iter()
+        "找不到后端可执行文件。\n\
+         已尝试冻结形态：随程序打包的 {BACKEND_EXE}\n\
+         已尝试开发形态：\n{}\n\
+         开发期请运行 scripts/restore-upstream.ps1，或用 SNAPBOT_BACKEND 显式指定。",
+        dev.iter()
             .map(|p| format!("  - {}", p.display()))
             .collect::<Vec<_>>()
             .join("\n")
     ))
+}
+
+/// 冻结后端可执行文件名（与 packaging/snapbot-backend.spec 的 name 保持一致）。
+const BACKEND_EXE: &str = "nanobot-backend.exe";
+
+fn workspace_root() -> Option<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
 }
 
 // ---------------------------------------------------------------- 探测
@@ -280,10 +336,15 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
         }
     }
 
-    let python = match resolve_python() {
-        Ok(python) => python,
+    let backend = match resolve_backend(cfg) {
+        Ok(backend) => backend,
         Err(err) => return (Err(err), configured_plan(cfg)),
     };
+    log_line(&format!(
+        "后端形态：{}（{}）",
+        if backend.is_frozen() { "冻结" } else { "开发 venv" },
+        backend.program().display()
+    ));
 
     // ---- 1) 已经在跑？直接附着（要求 /health 真的应了）----
     //
@@ -366,21 +427,28 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
 
     let health_port = plan.health;
 
-    let mut cmd = Command::new(&python);
-    cmd.arg("-m").arg("nanobot");
+    // 组装参数（**不含** `-m nanobot`，那部分由 BackendRuntime::command 决定）
+    let mut args: Vec<String> = Vec::new();
     let mode = if first_run {
-        cmd.arg("webui").arg("--yes").arg("--no-open");
+        args.push("webui".into());
+        args.push("--yes".into());
+        args.push("--no-open".into());
         "webui --yes --no-open".to_string()
     } else {
-        cmd.arg("gateway").arg("--foreground");
+        args.push("gateway".into());
+        args.push("--foreground".into());
         if let Some(path) = &override_cfg {
-            // --config 指定的是**覆盖文件**，它只改了 websocket.port
-            cmd.arg("--config").arg(path);
+            // --config 指向的是**覆盖文件**，它只改了 websocket.port
+            args.push("--config".into());
+            args.push(path.to_string_lossy().into_owned());
         }
         // 健康端口用 --port 直接覆盖，不必改配置文件
-        cmd.arg("--port").arg(health_port.to_string());
+        args.push("--port".into());
+        args.push(health_port.to_string());
         format!("gateway --foreground --port {health_port}")
     };
+
+    let mut cmd = backend.command(&args);
 
     // 关键：**不要把 bootstrapSecret 放进命令行**。它会出现在进程列表里。
     // 上游 cli/windows_browser.py 专门用「匿名管道 + ACL 保护文件」来规避这件事；
@@ -392,8 +460,20 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
         cmd.env("NANOBOT_SKIP_WEBUI_BUILD", "1");
     }
 
-    if let Some(root) = python.parent().and_then(|p| p.parent()) {
-        cmd.current_dir(root);
+    // 工作目录：冻结形态用 exe 所在目录（onedir 的 _internal 就在旁边）；
+    // 开发形态用检出根目录。
+    let program = backend.program().to_path_buf();
+    match &backend {
+        BackendRuntime::Frozen(_) => {
+            if let Some(dir) = program.parent() {
+                cmd.current_dir(dir);
+            }
+        }
+        BackendRuntime::Python(_) => {
+            if let Some(root) = program.parent().and_then(|p| p.parent()) {
+                cmd.current_dir(root);
+            }
+        }
     }
 
     cmd.stdin(Stdio::null())
@@ -408,18 +488,19 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
     }
 
     log_line(&format!(
-        "启动{}({}): {} -m nanobot {mode}",
+        "启动{}：{} {mode}",
         if first_run { "（首次运行）" } else { "" },
-        python.display(),
-        if first_run { "" } else { "模式 " }
+        backend.program().display()
     ));
+
+    let backend_path = backend.program().to_path_buf();
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             remove_override_config(cfg);
             return (
-                Err(format!("启动网关失败（{}）: {err}", python.display())),
+                Err(format!("启动网关失败（{}）: {err}", backend_path.display())),
                 plan,
             );
         }
@@ -428,7 +509,10 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
     // ---- 3) 首次运行：等上游把 config.json 写出来 ----
     if first_run {
         if let Err(err) = wait_for_config(&mut child, &cfg.config_path) {
-            let mut process = GatewayProcess { child, python };
+            let mut process = GatewayProcess {
+                child,
+                backend: backend_path,
+            };
             process.shutdown();
             remove_override_config(cfg);
             return (Err(err), plan);
@@ -438,7 +522,10 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
     // ---- 4) 轮询健康端点，确认真的能服务请求 ----
     let ready_timeout = if first_run { BOOTSTRAP_TIMEOUT } else { READY_TIMEOUT };
     if let Err(err) = wait_for_health(&mut child, &cfg.health_host, health_port, ready_timeout) {
-        let mut process = GatewayProcess { child, python };
+        let mut process = GatewayProcess {
+            child,
+            backend: backend_path,
+        };
         process.shutdown();
         remove_override_config(cfg);
         return (Err(err), plan);
@@ -453,7 +540,10 @@ pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, Por
         plan.webui
     ));
     (
-        Ok(GatewayState::Spawned(GatewayProcess { child, python })),
+        Ok(GatewayState::Spawned(GatewayProcess {
+            child,
+            backend: backend_path,
+        })),
         plan,
     )
 }

@@ -1,0 +1,69 @@
+# ============================================================
+#  SnapBot — desktop shell for nanobot
+# ============================================================
+#  设计原则：本仓库只跟踪「我们自己写的代码」。
+#  上游 nanobot 检出、第三方二进制、原档压缩包一律不入库
+#  （nanobot-0.3.5 有 527MB / 47406 文件，入库会毁掉仓库）。
+#  需要恢复上游时见 scripts/restore-upstream.ps1。
+# ============================================================
+
+# ---- 上游 nanobot 检出（体积巨大，用脚本恢复）----
+/nanobot-0.3.5/
+
+# ---- 第三方二进制/原档（体积巨大）----
+/nanobot-tui-win32-x64.exe/
+/原档/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+basedpyright/
+
+# ---- Node / 前端 ----
+node_modules/
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# ---- Rust / Tauri ----
+/desktop/src-tauri/target/
+/desktop/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# ---- 冻结打包产物（注意：上一条 dist/ 通配已覆盖 packaging/dist）----
+/packaging/build/
+/packaging/**/*.spec.bak
+*.pdb
+
+# ---- 运行时数据（绝不能入库，含凭据）----
+#   nanobot 的数据目录在用户目录，这里只是防御性排除
+config.json
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.env
+.env.*
+!/.env.example
+
+# ---- 安装程序产物 ----
+/installer/output/
+*.msi
+*.nsis.zip
+*.exe
+!nanobot终端.cmd
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

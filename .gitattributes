@@ -1,0 +1,20 @@
+# 归一化换行符，避免 Git 在 checkout 时改动工作区文件。
+# 本仓库含 .ps1 / .cmd 脚本，autocrlf 的隐式转换会带来无意义的 diff。
+* text=auto eol=lf
+
+# Windows 批处理用 CRLF 更稳妥（cmd.exe 对 LF-only 的批处理在某些版本上会出问题）
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# PowerShell 脚本统一 LF
+*.ps1 text eol=lf
+
+# 二进制
+*.exe   binary
+*.dll   binary
+*.zip   binary
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.woff  binary
+*.woff2 binary

@@ -84,10 +84,20 @@ FunctionEnd
 ;
 ;  开发形态下网关由 `nanobot-0.3.5\.venv\Scripts\python.exe -m nanobot gateway`
 ;  启动。不处理的话，它们会持有 config.json / llm_usage.sqlite3，
-;  导致删不干净。用 WMIC 按命令行匹配，比按进程名精确。
+;  导致删不干净。
+;
+;  注意 NSIS 的字符串字面量用单引号定界，**内部不能再出现单引号**。
+;  所以这里不用 wmic 的 `name='python.exe'` 写法（会截断字符串），
+;  改用 taskkill 按进程名 + PowerShell 按命令行筛选。
+;  失败的返回值一律忽略：清理失败不应阻断卸载。
 ; ----------------------------------------------------------------------------
 Function un.SnapBotStopBackgroundGateway
-  nsExec::ExecToLog 'wmic process where "name='python.exe' and commandline like '%nanobot%gateway%'" call terminate'
+  ; 按进程名杀掉 venv 的 python（开发形态网关就是它）
+  nsExec::ExecToLog 'taskkill /IM python.exe /T /F'
+  Pop $0
+  ; 再按命令行精确匹配一次，覆盖 python.exe 改名或包装的情形。
+  ; 用 -Command 传 PowerShell，外层单引号内不含单引号。
+  nsExec::ExecToLog 'powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \"Name=''python.exe''\" | Where-Object { $_.CommandLine -like ''*nanobot*gateway*'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"'
   Pop $0
   Sleep 500
 FunctionEnd

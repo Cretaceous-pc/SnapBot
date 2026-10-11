@@ -61,11 +61,16 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 端口被占自动回退 + 记住实际端口（已实测）
 - [x] 冻结 Python 后端为可分发目录（**120.7 MB**，已实测）
       → [`packaging/`](packaging/)
-- [ ] 安装程序实际构建（NSIS 产物 + WebView2 分发策略）
-- [ ] 代码签名与分发
+- [x] **NSIS 安装程序构建并实测**（`SnapBot_0.1.0_x64-setup.exe`，52.29 MB）
+      → [`docs/packaging.md`](docs/packaging.md)
+      - **独立运行**：清空全部 `SNAPBOT_*` 环境变量后，后端取自安装目录
+      - **升级不误删用户数据**（哨兵文件验证，39 → 39 文件）
+      - **卸载无残留**：`~/.nanobot` + 安装目录 + 注册表项全部清除
+- [ ] 代码签名（当前 `NotSigned`，用户首启会遇到 SmartScreen「未知发布者」）
+- [ ] WebView2 分发策略（当前未显式配置 `webviewInstallMode`）
+- [ ] 安装路径含中文/空格的兼容性测试
 
-> ⚠️ **尚未在打包产物上实测的两项**（见 `docs/packaging.md` 检查清单）：
-> NSIS 安装/卸载器的实际行为（卸载后 `~/.nanobot` 是否消失、
-> **升级覆盖安装是否误删用户数据**）。hooks 目前只在配置层面校验。
+> 安装包与构建产物均不入库（`packaging/dist/`、`target/` 已在 `.gitignore`）。
+> 重新构建：`.\packaging\build-backend.ps1` → `cd desktop\src-tauri; cargo tauri build`
 
 详细计划与决策记录见 [`docs/`](docs/)。

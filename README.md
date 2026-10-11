@@ -54,9 +54,16 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 开发期直连现有 `.venv`（**三条路径已实测**：附着已有网关 / 自行拉起并回收 / 首次运行引导）
 - [x] 首次运行引导：无配置时走上游初始化路径（实测 1.6s 生成配置、4.3s 网关就绪）
 - [x] 单实例锁（命名互斥体）、加载页进度与失败重试、日志落地 `~/.nanobot/logs/desktop.log`
+- [x] 界面默认简体中文（注入 `nanobot.locale`，已截图实测）
+- [x] 卸载清除 `%USERPROFILE%\.nanobot`（**Tauri 默认删不到这里**，见 packaging.md §4）
+- [x] 安装程序中文（`nsis.languages = SimpChinese`）
 - [ ] PyInstaller 冻结 Python 后端为 sidecar → [`docs/packaging.md`](docs/packaging.md)
 - [ ] 托盘图标、端口被占时自动换端口
 - [ ] 安装程序（NSIS/MSI）+ WebView2 分发策略
 - [ ] 代码签名与分发
+
+> ⚠️ 卸载 hooks 与安装程序语言**尚未在打包产物上实测**（当前还没有 NSIS 产物）。
+> `docs/packaging.md` 的检查清单里列了两条必须验的：卸载后 `~/.nanobot` 是否消失、
+> 以及**升级覆盖安装是否误删用户数据**（后者写错会让用户升级一次就丢光数据）。
 
 详细计划与决策记录见 [`docs/`](docs/)。

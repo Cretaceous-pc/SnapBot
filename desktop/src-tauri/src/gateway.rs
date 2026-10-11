@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, GatewayConfig};
 
+// serde_json 用于端口回退时改写配置（见 write_override_config）
+
 /// 单次 HTTP/TCP 探测的超时。健康轮询用，必须短。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
@@ -33,7 +35,6 @@ pub enum GatewayState {
     /// 复用已在运行的实例，退出时**不动它**
     Attached,
 }
-
 pub struct GatewayProcess {
     child: Child,
     /// 记录实际使用的解释器，排障时第一眼要看的东西
@@ -129,18 +130,17 @@ pub fn resolve_python() -> Result<PathBuf, String> {
 
 // ---------------------------------------------------------------- 探测
 
-/// 向 `/health` 发一个最小 HTTP/1.0 GET，确认对面**确实是 nanobot 网关**。
+/// 向 `/health` 发一个最小 HTTP/1.0 GET，返回响应体（失败返回空串）。
 ///
-/// 为什么不能只做 `TcpStream::connect`：端口上可能蹲着任何别的程序。
-/// 只测端口连通会把陌生服务误判成「网关已在运行」，然后「附着」上去，结果是白屏。
-/// 这里要求响应里带 `"status"` 字段才认。
-fn probe_health(host: &str, port: u16) -> bool {
+/// 用 HTTP/1.0 + `Connection: close`：让对端主动结束连接，
+/// 于是 `read_to_string` 能自然读到 EOF，不必解析 Content-Length。
+fn get_health(host: &str, port: u16) -> String {
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
         Ok(addr) => addr,
-        Err(_) => return false,
+        Err(_) => return String::new(),
     };
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) else {
-        return false;
+        return String::new();
     };
     let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
     let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
@@ -148,21 +148,169 @@ fn probe_health(host: &str, port: u16) -> bool {
     let request =
         format!("GET /health HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+        return String::new();
     }
     let mut response = String::new();
-    // HTTP/1.0 + Connection: close 会让对端主动结束，读不动就当作不可用。
     let _ = stream.read_to_string(&mut response);
-    response.contains("\"status\"")
+    response
+}
+
+/// 确认对面**确实是 nanobot 网关**。
+///
+/// 为什么不能只做 `TcpStream::connect`：端口上可能蹲着任何别的程序。
+/// 只测端口连通会把陌生服务误判成「网关已在运行」，然后「附着」上去，结果是白屏。
+/// 这里要求响应里带 `"status"` 字段才认。
+fn probe_health(host: &str, port: u16) -> bool {
+    get_health(host, port).contains("\"status\"")
+}
+
+/// 端口是否空闲（没有任何东西在监听）。
+fn port_is_free(host: &str, port: u16) -> bool {
+    let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err()
+}
+
+/// 端口回退的扫描上限。20 个足够覆盖「同机装了多个 nanobot 实例」的情况。
+const PORT_SCAN_LIMIT: u16 = 20;
+
+/// 实际使用的端口组合。
+///
+/// 调用方**必须**用它覆盖从磁盘读到的端口值：端口回退只写在临时覆盖文件里，
+/// 不会改写用户的 `config.json`，所以 `config::load()` 读回的仍是原始端口。
+pub struct PortPlan {
+    /// 网关健康端点实际使用的端口
+    pub health: u16,
+    /// WebUI / WebSocket 实际使用的端口
+    pub webui: u16,
+    /// 是否发生了回退（仅用于日志）
+    pub fell_back: bool,
+}
+
+/// 挑选可用端口：优先沿用配置里的端口，被占用才往后找。
+///
+/// 为什么要做这件事：两个端口都可能被别人占——18790 是 nanobot 自己的默认值，
+/// 用户很可能之前手动跑过一次 CLI 把它留在后台；8765 更是常见端口。
+/// 撞上了就直接起不来，而报错信息对普通用户毫无意义。
+pub fn plan_ports(cfg: &GatewayConfig) -> PortPlan {
+    for offset in 0..PORT_SCAN_LIMIT {
+        let mut health = cfg.health_port.saturating_add(offset);
+        if health < 1024 {
+            health = 1024 + offset; // 跳过特权端口
+        }
+        let mut webui = cfg.webui_port.saturating_add(offset);
+        if webui < 1024 {
+            webui = 1024 + offset;
+        }
+        // 两者撞到同一个号时让 webui 再挪一格
+        let webui_port = if webui == health { webui + 1 } else { webui };
+
+        if port_is_free(&cfg.health_host, health) && port_is_free(&cfg.webui_host, webui_port) {
+            let fell_back = health != cfg.health_port || webui_port != cfg.webui_port;
+            return PortPlan {
+                health,
+                webui: webui_port,
+                fell_back,
+            };
+        }
+    }
+
+    // 全都被占：退回配置值，让上游自己报错（比我们瞎猜一个端口好）
+    PortPlan {
+        health: cfg.health_port,
+        webui: cfg.webui_port,
+        fell_back: false,
+    }
+}
+
+/// 写一份临时配置，只覆盖 WebUI 端口，交给上游 `--config` 使用。
+///
+/// 为什么不原地改用户的 config.json：那是用户的数据，我们无权改写；
+/// 而且下次启动端口可能又变了，反复改写会把配置搞得面目全非。
+/// 覆盖文件只是一个**启动参数**，用完即弃。
+fn write_override_config(cfg: &GatewayConfig, webui_port: u16) -> Result<PathBuf, String> {
+    let raw = std::fs::read_to_string(&cfg.config_path)
+        .map_err(|err| format!("读取配置失败 {}: {err}", cfg.config_path.display()))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|err| format!("解析配置失败: {err}"))?;
+
+    // 只精确改 channels.websocket.port，其余原样保留
+    let slot = doc
+        .get_mut("channels")
+        .and_then(|channels| channels.get_mut("websocket"))
+        .and_then(|ws| ws.get_mut("port"))
+        .ok_or("配置里找不到 channels.websocket.port，无法覆盖端口")?;
+    *slot = serde_json::Value::from(webui_port);
+
+    let target = override_config_path(cfg)?;
+    std::fs::write(&target, serde_json::to_string_pretty(&doc).unwrap_or_default())
+        .map_err(|err| format!("写覆盖配置失败 {}: {err}", target.display()))?;
+    Ok(target)
+}
+
+fn override_config_path(cfg: &GatewayConfig) -> Result<PathBuf, String> {
+    Ok(cfg
+        .config_path
+        .parent()
+        .ok_or("配置路径没有父目录")?
+        .join("config.snapbot-override.json"))
+}
+
+/// 删除覆盖配置（尽力而为，失败不影响功能）。
+fn remove_override_config(cfg: &GatewayConfig) {
+    if let Ok(path) = override_config_path(cfg) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // ---------------------------------------------------------------- 启动网关
 
-/// 起一个新网关。返回状态供调用方决定退出时是否回收。
-pub fn ensure_running(cfg: &GatewayConfig) -> Result<GatewayState, String> {
-    let python = resolve_python()?;
+/// 起一个新网关。
+///
+/// 返回 `(状态, 实际端口计划)`。调用方**必须**用返回的端口计划覆盖从磁盘读到的
+/// 端口值——端口回退只写在临时覆盖文件里，不会改写用户的 `config.json`。
+pub fn ensure_running(cfg: &GatewayConfig) -> (Result<GatewayState, String>, PortPlan) {
+    /// 附着场景下的端口计划：对方用的就是配置里的端口。
+    fn configured_plan(cfg: &GatewayConfig) -> PortPlan {
+        PortPlan {
+            health: cfg.health_port,
+            webui: cfg.webui_port,
+            fell_back: false,
+        }
+    }
+
+    let python = match resolve_python() {
+        Ok(python) => python,
+        Err(err) => return (Err(err), configured_plan(cfg)),
+    };
 
     // ---- 1) 已经在跑？直接附着（要求 /health 真的应了）----
+    //
+    // 先看本应用上次记录的端口，再看配置端口。
+    // 为什么需要这一步：端口回退后，应用**不会**改写用户的 config.json，
+    // 于是新实例按配置端口去探测就会**错过**正在运行的网关（它跑在回退端口上），
+    // 转而以为没人跑、去起第二个网关。实测踩到过这个现象。
+    let recorded = recorded_shell_ports();
+    if let Some(ports) = &recorded {
+        if (ports.health != cfg.health_port || ports.webui != cfg.webui_port)
+            && probe_health(&cfg.health_host, ports.health)
+        {
+            log_line(&format!(
+                "发现本应用上次运行在回退端口上（health={} webui={}），附着而不重启",
+                ports.health, ports.webui
+            ));
+            return (
+                Ok(GatewayState::Attached),
+                PortPlan {
+                    health: ports.health,
+                    webui: ports.webui,
+                    fell_back: true,
+                },
+            );
+        }
+    }
+
     if probe_health(&cfg.health_host, cfg.health_port) {
         if let Some(pid) = recorded_gateway_pid() {
             if pid_alive(pid) {
@@ -171,7 +319,7 @@ pub fn ensure_running(cfg: &GatewayConfig) -> Result<GatewayState, String> {
                 log_line("健康端点有响应，但记录的 pid 已不存在，仍按附着处理");
             }
         }
-        return Ok(GatewayState::Attached);
+        return (Ok(GatewayState::Attached), configured_plan(cfg));
     }
 
     // ---- 2) 决定用哪种方式起 ----
@@ -185,17 +333,53 @@ pub fn ensure_running(cfg: &GatewayConfig) -> Result<GatewayState, String> {
         log_line("未找到配置，走首次运行引导（上游 webui --yes --no-open）");
     }
 
+    // ---- 2b) 端口回退（仅非首次运行）----
+    //
+    // 首次运行的端口由上游初始化决定，此时还没法覆盖，直接用配置里的值。
+    // 非首次运行时先探测：如果端口被别人占（18790 是 nanobot 自己的默认值，
+    // 用户很可能之前跑过一次 CLI 留在后台；8765 更是常见端口），
+    // 就往后找一组空闲的，并通过临时覆盖配置 + --port 交给上游。
+    let (plan, override_cfg) = if first_run {
+        (configured_plan(cfg), None)
+    } else {
+        let plan = plan_ports(cfg);
+        if plan.fell_back {
+            log_line(&format!(
+                "端口被占用，改用 health={} webui={}（配置原值 {}/{}）",
+                plan.health, plan.webui, cfg.health_port, cfg.webui_port
+            ));
+        }
+        let override_path = if plan.webui != cfg.webui_port {
+            match write_override_config(cfg, plan.webui) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    log_line(&format!("写端口覆盖配置失败，无法回退端口: {err}"));
+                    remove_override_config(cfg);
+                    return (Err(err), plan);
+                }
+            }
+        } else {
+            None
+        };
+        (plan, override_path)
+    };
+
+    let health_port = plan.health;
+
     let mut cmd = Command::new(&python);
     cmd.arg("-m").arg("nanobot");
     let mode = if first_run {
         cmd.arg("webui").arg("--yes").arg("--no-open");
         "webui --yes --no-open".to_string()
     } else {
-        cmd.arg("gateway")
-            .arg("--foreground")
-            .arg("--port")
-            .arg(cfg.health_port.to_string());
-        format!("gateway --foreground --port {}", cfg.health_port)
+        cmd.arg("gateway").arg("--foreground");
+        if let Some(path) = &override_cfg {
+            // --config 指定的是**覆盖文件**，它只改了 websocket.port
+            cmd.arg("--config").arg(path);
+        }
+        // 健康端口用 --port 直接覆盖，不必改配置文件
+        cmd.arg("--port").arg(health_port.to_string());
+        format!("gateway --foreground --port {health_port}")
     };
 
     // 关键：**不要把 bootstrapSecret 放进命令行**。它会出现在进程列表里。
@@ -230,29 +414,48 @@ pub fn ensure_running(cfg: &GatewayConfig) -> Result<GatewayState, String> {
         if first_run { "" } else { "模式 " }
     ));
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("启动网关失败（{}）: {err}", python.display()))?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            remove_override_config(cfg);
+            return (
+                Err(format!("启动网关失败（{}）: {err}", python.display())),
+                plan,
+            );
+        }
+    };
 
     // ---- 3) 首次运行：等上游把 config.json 写出来 ----
     if first_run {
         if let Err(err) = wait_for_config(&mut child, &cfg.config_path) {
             let mut process = GatewayProcess { child, python };
             process.shutdown();
-            return Err(err);
+            remove_override_config(cfg);
+            return (Err(err), plan);
         }
     }
 
     // ---- 4) 轮询健康端点，确认真的能服务请求 ----
     let ready_timeout = if first_run { BOOTSTRAP_TIMEOUT } else { READY_TIMEOUT };
-    if let Err(err) = wait_for_health(&mut child, cfg, ready_timeout) {
+    if let Err(err) = wait_for_health(&mut child, &cfg.health_host, health_port, ready_timeout) {
         let mut process = GatewayProcess { child, python };
         process.shutdown();
-        return Err(err);
+        remove_override_config(cfg);
+        return (Err(err), plan);
     }
 
-    log_line("网关健康端点已就绪");
-    Ok(GatewayState::Spawned(GatewayProcess { child, python }))
+    // 覆盖配置只在启动时被上游读一次，就绪后即可清掉，不留垃圾文件。
+    // （清早于就绪有风险：上游可能还在读；就绪即证明它已经读完了。）
+    remove_override_config(cfg);
+
+    log_line(&format!(
+        "网关健康端点已就绪（health={health_port}，webui={}）",
+        plan.webui
+    ));
+    (
+        Ok(GatewayState::Spawned(GatewayProcess { child, python })),
+        plan,
+    )
 }
 
 /// 等上游写出配置文件。
@@ -280,7 +483,8 @@ fn wait_for_config(child: &mut Child, config_path: &Path) -> Result<(), String> 
 /// 轮询健康端点直到就绪、进程退出或超时。
 fn wait_for_health(
     child: &mut Child,
-    cfg: &GatewayConfig,
+    host: &str,
+    port: u16,
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
@@ -288,7 +492,7 @@ fn wait_for_health(
         if let Some(err) = child_exited(child) {
             return Err(err);
         }
-        if probe_health(&cfg.health_host, cfg.health_port) {
+        if probe_health(host, port) {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -364,6 +568,55 @@ fn recorded_gateway_pid() -> Option<u32> {
         .join("gateway.json");
     let raw = std::fs::read_to_string(path).ok()?;
     json_u32_field(&raw, "pid")
+}
+
+/// 本应用上次实际使用的端口。
+pub struct ShellPorts {
+    pub health: u16,
+    pub webui: u16,
+}
+
+fn shell_state_path() -> Option<PathBuf> {
+    Some(
+        config::nanobot_data_dir()
+            .ok()?
+            .join("run")
+            .join("snapbot-desktop.json"),
+    )
+}
+
+/// 记录本次实际使用的端口。
+///
+/// 为什么需要：端口回退后我们**不改写**用户的 `config.json`（那是用户的数据），
+/// 于是下次启动时无从得知上次跑在哪个端口。把结果记在自己的状态文件里，
+/// 下次就能先探测这些端口，正确附着到仍在运行的网关。
+pub fn remember_ports(plan: &PortPlan) {
+    let Some(path) = shell_state_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let payload = serde_json::json!({
+        "healthPort": plan.health,
+        "webuiPort": plan.webui,
+    });
+    let _ = std::fs::write(&path, payload.to_string());
+}
+
+/// 读取上次记录的端口。文件不存在或字段缺失时返回 None。
+fn recorded_shell_ports() -> Option<ShellPorts> {
+    let path = shell_state_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    Some(ShellPorts {
+        health: json_u32_field(&raw, "healthPort")? as u16,
+        webui: json_u32_field(&raw, "webuiPort")? as u16,
+    })
+}
+
+/// 退出时清掉状态文件；下次启动会重新写入。
+pub fn forget_ports() {
+    if let Some(path) = shell_state_path() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 判断某个 pid 是否还活着。
@@ -488,6 +741,74 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一个只在测试内使用的配置，端口由调用方指定。
+    fn cfg_with_ports(health: u16, webui: u16) -> GatewayConfig {
+        GatewayConfig {
+            health_port: health,
+            webui_port: webui,
+            health_host: "127.0.0.1".to_string(),
+            webui_host: "127.0.0.1".to_string(),
+            ..GatewayConfig::default()
+        }
+    }
+
+    /// 占住一个端口并返回它。用 0 让内核挑，避免测试之间抢固定端口。
+    fn occupy_a_port() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        (listener, port)
+    }
+
+    #[test]
+    fn plan_ports_keeps_configured_ports_when_free() {
+        let (l1, health) = occupy_a_port();
+        let (l2, webui) = occupy_a_port();
+        // 关掉监听 → 端口空闲
+        drop(l1);
+        drop(l2);
+        let plan = plan_ports(&cfg_with_ports(health, webui));
+        // 空闲时应当原样沿用（除非恰好被别的进程抢走，概率极低）
+        assert!(!plan.fell_back, "端口空闲时不该回退");
+        assert_eq!(plan.health, health);
+        assert_eq!(plan.webui, webui);
+    }
+
+    /// 核心场景：端口被占用时必须回退，且两个端口都要挪。
+    #[test]
+    fn plan_ports_falls_back_when_occupied() {
+        let (l1, health) = occupy_a_port();
+        let (l2, webui) = occupy_a_port();
+        // 两个监听都**保持存活**，模拟被别的程序占用
+        let plan = plan_ports(&cfg_with_ports(health, webui));
+        assert!(plan.fell_back, "端口被占时必须回退");
+        assert_ne!(plan.health, health);
+        assert_ne!(plan.webui, webui);
+        // 回退到的端口应当真的空闲
+        assert!(port_is_free("127.0.0.1", plan.health));
+        assert!(port_is_free("127.0.0.1", plan.webui));
+        drop(l1);
+        drop(l2);
+    }
+
+    /// 两个端口撞号时，webui 必须被挪开，不能与 health 相同。
+    #[test]
+    fn plan_ports_never_collides_health_with_webui() {
+        let (l, p) = occupy_a_port();
+        drop(l);
+        // 故意把 health 与 webui 设成同一个号
+        let plan = plan_ports(&cfg_with_ports(p, p));
+        assert_ne!(plan.health, plan.webui, "health 与 webui 不能同号");
+    }
+
+    #[test]
+    fn port_is_free_detects_listener() {
+        let (listener, port) = occupy_a_port();
+        assert!(!port_is_free("127.0.0.1", port), "有监听时应判定为不空闲");
+        // 关掉监听后应恢复为空闲
+        drop(listener);
+        assert!(port_is_free("127.0.0.1", port), "监听关闭后应判定为空闲");
+    }
 
     #[test]
     fn parses_pid_from_gateway_state() {

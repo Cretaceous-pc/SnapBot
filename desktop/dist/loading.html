@@ -68,6 +68,7 @@
   var err   = document.getElementById('err');
   var retry = document.getElementById('retry');
   var started = Date.now();
+  var sawOnboarding = false;
 
   function invoke(cmd) {
     var g = window.__TAURI__;
@@ -83,6 +84,17 @@
     return Math.round((Date.now() - started) / 1000);
   }
 
+  function progress() {
+    if (sawOnboarding) {
+      // 首次运行要初始化配置并构建前端产物，比常规启动慢得多。
+      // 必须让用户知道在等什么，否则会被当成卡死。
+      msg.textContent = '首次运行：正在初始化并构建界面…（已等待 '
+        + elapsed() + ' 秒，可能需要 1–2 分钟）';
+    } else {
+      msg.textContent = '正在启动本地服务…（已等待 ' + elapsed() + ' 秒）';
+    }
+  }
+
   function fail(text) {
     bar.style.display = 'none';
     msg.textContent = '启动失败';
@@ -93,16 +105,17 @@
 
   function poll() {
     invoke('bootstrap_status').then(function (s) {
-      if (s && s.failed) {
-        fail(s.error || '未知错误');
-        return;
-      }
-      if (s && s.ready && s.url) {
-        msg.textContent = '正在打开界面…';
+      if (!s) { setTimeout(poll, 400); return; }
+      if (s.onboarding) sawOnboarding = true;
+      if (s.failed) { fail(s.error || '未知错误'); return; }
+      if (s.ready && s.url) {
+        msg.textContent = sawOnboarding
+          ? '初始化完成，正在打开界面…（随后请在 Settings → Models 里配置模型）'
+          : '正在打开界面…';
         window.location.replace(s.url);
         return;
       }
-      msg.textContent = '正在启动本地服务…（已等待 ' + elapsed() + ' 秒）';
+      progress();
       setTimeout(poll, 400);
     }).catch(function (e) {
       fail('与桌面壳通信失败：' + (e && e.message ? e.message : e));

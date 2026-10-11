@@ -79,6 +79,25 @@ pub struct GatewayConfig {
     pub secret: String,
     pub websocket_enabled: bool,
     pub config_path: PathBuf,
+    /// 这是不是一次「首次运行」——配置文件还不存在，需要走上游初始化路径
+    pub needs_onboarding: bool,
+}
+
+impl Default for GatewayConfig {
+    /// 首次运行时的占位配置：端口用上游 schema 的默认值，
+    /// `needs_onboarding = true` 告诉 `gateway::ensure_running` 走上游初始化路径。
+    fn default() -> Self {
+        Self {
+            webui_port: 8765,
+            webui_host: "127.0.0.1".to_string(),
+            health_port: 18790,
+            health_host: "127.0.0.1".to_string(),
+            secret: String::new(),
+            websocket_enabled: true,
+            config_path: PathBuf::new(),
+            needs_onboarding: true,
+        }
+    }
 }
 
 impl GatewayConfig {
@@ -93,13 +112,21 @@ impl GatewayConfig {
         }
         format!("{base}/#/?bootstrapSecret={}", percent_encode(&self.secret))
     }
+}
 
-    /// 健康检查 URL。目前探测走 TCP 连接（见 `gateway::port_open`），
-    /// 保留此方法供后续需要解析 `/health` 响应体时使用。
-    #[allow(dead_code)]
-    pub fn health_url(&self) -> String {
-        format!("http://{}:{}/health", host_for_url(&self.health_host), self.health_port)
+/// 只读配置，且容忍「文件还不存在」。
+///
+/// 引导流程第一步需要它——此时 `config.json` 在首次运行时**本来就不存在**，
+/// 那是预期状态而不是错误。真正的初始化交给
+/// `gateway::ensure_running` 走上游的 `webui --yes --no-open` 路径完成。
+pub fn load_or_default() -> Result<GatewayConfig, String> {
+    let path = config_path()?;
+    if !path.is_file() {
+        let mut cfg = GatewayConfig::default();
+        cfg.config_path = path;
+        return Ok(cfg);
     }
+    load()
 }
 
 /// 上游 `_host_for_local_browser` 的等价物：通配绑定要换成回环地址才能访问。
@@ -130,10 +157,7 @@ pub fn load() -> Result<GatewayConfig, String> {
     let raw = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "还没有配置文件：{}\n请先用 nanobot 初始化（或让桌面壳首次运行时引导创建）。",
-                path.display()
-            ));
+            return Err(format!("还没有配置文件：{}", path.display()));
         }
         Err(err) => return Err(format!("读取配置失败 {}: {err}", path.display())),
     };
@@ -157,6 +181,8 @@ pub fn load() -> Result<GatewayConfig, String> {
         secret,
         websocket_enabled: ws.enabled,
         config_path: path,
+        // 能走到这里说明配置文件本来就存在，不是首次运行
+        needs_onboarding: false,
     })
 }
 
@@ -164,34 +190,35 @@ pub fn load() -> Result<GatewayConfig, String> {
 mod tests {
     use super::*;
 
+    /// 测试用基准配置：只覆盖关心的字段，避免每加一个字段就要改三处测试。
+    fn sample(secret: &str) -> GatewayConfig {
+        GatewayConfig {
+            secret: secret.to_string(),
+            config_path: PathBuf::from("x"),
+            needs_onboarding: false,
+            ..GatewayConfig::default()
+        }
+    }
+
     #[test]
     fn url_without_secret_is_bare_base() {
-        let cfg = GatewayConfig {
-            webui_port: 8765,
-            webui_host: "127.0.0.1".into(),
-            health_port: 18790,
-            health_host: "127.0.0.1".into(),
-            secret: String::new(),
-            websocket_enabled: true,
-            config_path: PathBuf::from("x"),
-        };
-        assert_eq!(cfg.browser_url(), "http://127.0.0.1:8765");
+        assert_eq!(sample("").browser_url(), "http://127.0.0.1:8765");
     }
 
     #[test]
     fn url_encodes_secret() {
-        let cfg = GatewayConfig {
-            webui_port: 8765,
-            webui_host: "127.0.0.1".into(),
-            health_port: 18790,
-            health_host: "127.0.0.1".into(),
-            secret: "a b+c/d?e".into(),
-            websocket_enabled: true,
-            config_path: PathBuf::from("x"),
-        };
         assert_eq!(
-            cfg.browser_url(),
+            sample("a b+c/d?e").browser_url(),
             "http://127.0.0.1:8765/#/?bootstrapSecret=a%20b%2Bc%2Fd%3Fe"
+        );
+    }
+
+    #[test]
+    fn url_keeps_url_safe_characters_unencoded() {
+        // token_urlsafe 的字母表是 A-Za-z0-9-_，这些都不该被编码
+        assert_eq!(
+            sample("abZ0-_.~").browser_url(),
+            "http://127.0.0.1:8765/#/?bootstrapSecret=abZ0-_.~"
         );
     }
 
@@ -199,6 +226,17 @@ mod tests {
     fn wildcard_bind_maps_to_loopback() {
         assert_eq!(host_for_url("0.0.0.0"), "127.0.0.1");
         assert_eq!(host_for_url("::"), "127.0.0.1");
+        assert_eq!(host_for_url("[::]"), "127.0.0.1");
+        assert_eq!(host_for_url(""), "127.0.0.1");
         assert_eq!(host_for_url("localhost"), "localhost");
+    }
+
+    #[test]
+    fn default_config_signals_onboarding() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.needs_onboarding);
+        assert_eq!(cfg.webui_port, 8765);
+        assert_eq!(cfg.health_port, 18790);
+        assert!(cfg.websocket_enabled);
     }
 }

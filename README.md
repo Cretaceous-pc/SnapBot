@@ -57,13 +57,15 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 界面默认简体中文（注入 `nanobot.locale`，已截图实测）
 - [x] 卸载清除 `%USERPROFILE%\.nanobot`（**Tauri 默认删不到这里**，见 packaging.md §4）
 - [x] 安装程序中文（`nsis.languages = SimpChinese`）
-- [ ] PyInstaller 冻结 Python 后端为 sidecar → [`docs/packaging.md`](docs/packaging.md)
-- [ ] 托盘图标、端口被占时自动换端口
-- [ ] 安装程序（NSIS/MSI）+ WebView2 分发策略
+- [x] 托盘图标：关窗隐藏到托盘，托盘菜单退出并回收网关（已实测）
+- [x] 端口被占自动回退 + 记住实际端口（已实测）
+- [x] 冻结 Python 后端为可分发目录（**120.7 MB**，已实测）
+      → [`packaging/`](packaging/)
+- [ ] 安装程序实际构建（NSIS 产物 + WebView2 分发策略）
 - [ ] 代码签名与分发
 
-> ⚠️ 卸载 hooks 与安装程序语言**尚未在打包产物上实测**（当前还没有 NSIS 产物）。
-> `docs/packaging.md` 的检查清单里列了两条必须验的：卸载后 `~/.nanobot` 是否消失、
-> 以及**升级覆盖安装是否误删用户数据**（后者写错会让用户升级一次就丢光数据）。
+> ⚠️ **尚未在打包产物上实测的两项**（见 `docs/packaging.md` 检查清单）：
+> NSIS 安装/卸载器的实际行为（卸载后 `~/.nanobot` 是否消失、
+> **升级覆盖安装是否误删用户数据**）。hooks 目前只在配置层面校验。
 
 详细计划与决策记录见 [`docs/`](docs/)。

@@ -30,6 +30,9 @@
       "../../packaging/dist/nanobot-backend": "nanobot-backend"
     },
     "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
       "nsis": {
         "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": false,

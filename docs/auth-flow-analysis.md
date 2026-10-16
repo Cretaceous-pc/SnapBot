@@ -91,7 +91,7 @@ const handleLogout = () => {
 - 收益：去掉伪功能与语义误导；auth 界面回归「异常兜底」单一职责
 - 风险：无（`clearSavedSecret` 函数保留，auth 兜底路径不受影响）
 
-### 方案 B（建议的下一步）：让 Tauri 在配置缺失时自愈，而非让用户手输
+### 方案 B（已实施，见第七节）：让 Tauri 在配置缺失时自愈，而非让用户手输
 **目标**：把上面的情况 1、2 也变成自动完成，使 auth 界面只在真正异常时出现。
 
 现状的断点在于：`run_bootstrap` 只读一次配置。若首次初始化没能在读取前写出
@@ -106,10 +106,10 @@ const handleLogout = () => {
 3. 超时仍拿不到，才落到 auth 界面并给出明确文案（「未能自动读取网关密钥，请检查
    config.json 的 channels.websocket.tokenIssueSecret」）。
 
-- 改动面：`desktop/src-tauri/src/main.rs`（时序）+ `gateway.rs`（可选的重试辅助）
+- 改动面：`desktop/src-tauri/src/main.rs`（时序）+ `config.rs`（轮询辅助）
 - 收益：打包端基本告别手输密码
 - 风险：中等 —— 涉及启动时序与超时；需要真实安装包上验证首次运行与「配置被删后重启」
-  两条路径。**建议独立一轮做，并配合一次 NSIS 安装包实测。**
+  两条路径。**已按此建议独立一轮实施并配合 NSIS 安装包实测，见第七节。**
 
 ### 方案 C（不推荐）：彻底删除 auth 界面
 只有在「桌面端是唯一入口、且 secret 注入 100% 可靠」时才成立。
@@ -160,3 +160,58 @@ await waitFor(() => expect(historyCalls).toBe(2));
 
 因此全量跑偶尔出现 `1 failed | 1428 passed` 属正常，**不要**把它当成回归去「修」。
 如需消除，应加大该 `waitFor` 的 timeout——但那属于独立的上游测试稳定性问题。
+
+---
+
+## 七、方案 B 实施与验证记录（2026-10-16）
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `desktop/src-tauri/src/config.rs` | 新增 `wait_for_secret(timeout, interval, load)`：轮询直到 `tokenIssueSecret` 非空。`load` 作为参数注入，因此可用脚本化的假读取做单元测试。超时返回 `SecretWaitOutcome { last, attempts, waited }` —— **把最后一次读到的配置交出来**，否则超时会让引导在无关的地方失败 |
+| `desktop/src-tauri/src/main.rs` | 第三步由「首次运行时读一次配置」改为「secret 为空时轮询等待」；新增 `SECRET_WAIT_TIMEOUT = 15s` / `SECRET_WAIT_INTERVAL = 250ms`；`Bootstrap` 新增 `warning` 字段并经 `bootstrap_status` 暴露；`bootstrap_retry` 清空 warning |
+| `desktop/dist/index.html`、`loading.html` | 新增非致命提示块：就绪但带 warning 时，先讲清楚再进入（10 秒倒计时 + 「立即进入」按钮），而不是让用户一脸茫然地看到密码框 |
+
+**常规启动零开销**：secret 本来就在配置里时，`cfg.secret.is_empty()` 为假，
+整个轮询分支不进入，启动时序与改动前完全一致。
+
+### 改前 / 改后
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| 常规启动（secret 已在） | 直接进 WebUI | 直接进 WebUI（不变） |
+| 首次运行、配置尚未生成 | 读一次配置；读早了就丢掉 secret → 密码框 | 轮询等到写入为止（实测 0ms 命中，因为网关就绪时已写好） |
+| 配置存在但 secret 为空 | 立即以无凭据 URL 开窗 | 等 15 秒；超时则**先给出明确文案**再进入 |
+| 配置一直读不到（全失败） | 引导失败 | 超时后用原配置（含端口）继续启动，不额外失败 |
+
+### 验证（真实安装包，非开发形态）
+
+安装包重新构建：`SnapBot_0.1.0_x64-setup.exe`，259.3 MiB，
+SHA256 `8E86A9B0DB2B55B6811FF766AABCE3404750D63D5211EC7BE586A10309D7C1A4`，
+静默安装后占用仍 130.6 MB。
+
+| 验证项 | 方法 | 结果 |
+|---|---|---|
+| Rust 单元测试 | `cargo test` | ✅ 22/22 通过（含 5 条新增：立即命中 / 等到第三次出现 / 持续读错超时 / 超时交出 last / 超时常量下界） |
+| **首次运行自愈** | 删掉 `~/.nanobot` 后启动安装版 | ✅ 日志 `已等到网关写入 tokenIssueSecret` → `首次运行完成：凭据 已生成`；`/health` 6.4s 就绪、WebUI HTTP 200；截图确认**直接进入 WebUI，无密码框** |
+| **secret 为空** | 把 `tokenIssueSecret` 改成空串后启动 | ✅ 日志 `等待 15 秒（61 次读取）仍未读到 tokenIssueSecret`；截图确认提示页文案与「立即进入（10）」倒计时 |
+| 兜底落点 | 上一条继续观察 | ✅ 空 secret 时上游按 localhost 判定放行，仍进入 WebUI（未出现密码框） |
+| 卸载清理 | `uninstall.exe /S` | ✅ 安装目录 / 注册表 / 开始菜单 / `~/.nanobot` 全部清除 |
+
+> 结论：打包端正常情况下**不会**再看到密码框；只有配置真的读不到时才会出现，
+> 而且出现前一定有中文说明。
+
+### 踩坑（与功能无关，但值得记）
+
+1. **截图截错窗口**：`SetForegroundWindow` 在终端占用前台时会被系统拒绝，
+   第一次截到的是浏览器。改用 `PrintWindow(hwnd, ..., PW_RENDERFULLCONTENT=0x2)`
+   直接取窗口像素，与 z-order 无关。
+2. **截图被放大裁切**：PowerShell 进程默认 DPI-unaware，`GetWindowRect` 返回的是
+   *虚拟化*后的逻辑尺寸，`PrintWindow` 画出来就变成放大的局部。
+   先调 `SetProcessDPIAware()` 才拿到 1:1 的图（实测 1293×896 → 2586×1791）。
+3. **测试脚本里的中文匹配全部失效**：脚本正文是 ASCII-only，但我在里面写了中文
+   日志关键字，PS 5.1 按 GBK 解码后正则永远匹配不到——表现为「日志里明明有，
+   脚本却说没等到」。改成用码点拼关键字（`[char]0x4ECD…`）。
+   同一个坑本项目已经踩过三次（`.cmd`、`.ps1`、以及子代理改中文测试文件）。
+

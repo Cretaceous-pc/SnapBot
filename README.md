@@ -64,6 +64,10 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 功能减法：删除「自动任务」UI 与后端路由（**保留 `cron` 引擎与工具**）、
       删除浏览器端「注销」（保留供应商 OAuth 注销）
       → [`docs/auth-flow-analysis.md`](docs/auth-flow-analysis.md)
+- [x] **认证自愈（方案 B）**：`tokenIssueSecret` 未就绪时轮询等待（15s / 250ms），
+      不再读一次就退到密码框；超时先给出中文文案再进入。实测首次运行与
+      「secret 为空」两条路径**都没有出现密码框**
+      → [`docs/auth-flow-analysis.md`](docs/auth-flow-analysis.md) §7
 - [x] **NSIS 安装程序构建并实测**（`SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**，
       WebView2 离线安装模式）→ [`docs/packaging.md`](docs/packaging.md)
       - **独立运行**：清空全部 `SNAPBOT_*` 环境变量后，后端取自安装目录

@@ -73,8 +73,9 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
       - **已删功能未进包**：核对 `installer.nsi` 清单，422/422 asset 匹配
 - [x] WebView2 分发策略：`offlineInstaller`（安装包 +127 MB，免掉「装完白屏」）
 - [x] 开始菜单补卸载入口（Tauri 模板只注册注册表项，用户找不到卸载）
+- [x] **安装路径含中文/空格的兼容性**：实测装到 `D:\安装 测试\SnapBot 空格`，
+      壳与冻结后端均从该路径启动，`/health` 就绪、WebUI HTTP 200、卸载清理干净
 - [ ] 代码签名（当前 `NotSigned`，用户首启会遇到 SmartScreen「未知发布者」）
-- [ ] 安装路径含中文/空格的兼容性测试
 
 > 安装包与构建产物均不入库（`packaging/dist/`、`target/` 已在 `.gitignore`）。
 > 重新构建：`.\packaging\build-backend.ps1` → `cd desktop\src-tauri; cargo tauri build`

@@ -1,0 +1,250 @@
+diff --git a/docs/automations.md b/docs/automations.md
+index 56d779b..c8f69ad 100644
+--- a/docs/automations.md
++++ b/docs/automations.md
+@@ -117,20 +117,25 @@ Heartbeat is enabled by default when `nanobot gateway` starts. Configure it in
+ 
+ ## Manage Automations
+ 
+-Use the WebUI Automations view to:
+-
+-- filter by all, active, paused, needs-attention, or system jobs;
+-- search by task name, message, trigger command, linked topic, schedule, or
+-  status;
+-- sort by next run, last run, updated time, or name;
+-- run scheduled automations now;
+-- pause or resume, rename, or delete user-created automations;
+-- copy the CLI command for local triggers;
+-- inspect protected system automations without changing them.
+-
+-Local triggers do not have a WebUI "Run now" action because each run needs a
+-message. Copy the `nanobot trigger ...` command from the WebUI and replace
+-`"message"` with the content that should be delivered.
++Manage automations by asking nanobot in the linked topic. There is no separate
++automations management screen; the agent's `cron` tool is the management surface.
++Ask in the topic to:
++
++- list the automations linked to that topic and see their schedule, status, and
++  next run;
++- run a scheduled automation now instead of waiting for the next occurrence;
++- pause or resume it, rename it, or change its schedule;
++- delete an automation you no longer want;
++- inspect protected system automations such as heartbeat, which cannot be
++  changed this way.
++
++You can also search or filter by describing what you want, for example "show me
++the paused automations for this topic" or "what does the nightly backup job do?"
++
++Local triggers are not run with a "Run now" action because each run needs a
++message. Use the `nanobot trigger ...` command nanobot gave you when the trigger
++was created and replace `"message"` with the content that should be delivered.
++Ask in the topic to list or delete the triggers linked to it.
+ 
+ ## Delivery and Reliability
+ 
+@@ -189,12 +194,11 @@ config as the gateway.
+ If a trigger message appears twice after a restart, treat it as expected
+ at-least-once delivery and make the external message idempotent.
+ 
+-If you need to edit, pause, resume, rename, delete, or inspect automations, use
+-the WebUI Automations view.
++If you need to edit, pause, resume, rename, delete, or inspect automations, ask
++nanobot in the topic the automation is linked to.
+ 
+ ## Related Docs
+ 
+-- [`webui.md#automations`](./webui.md#automations) for the browser management view
+ - [`chat-commands.md#local-triggers`](./chat-commands.md#local-triggers) for `/trigger`
+ - [`cli-reference.md#local-triggers`](./cli-reference.md#local-triggers) for `nanobot trigger`
+ - [`configuration.md#gateway-heartbeat`](./configuration.md#gateway-heartbeat) for heartbeat settings
+diff --git a/docs/chat-commands.md b/docs/chat-commands.md
+index c0419da..dcdd677 100644
+--- a/docs/chat-commands.md
++++ b/docs/chat-commands.md
+@@ -91,7 +91,7 @@ the turn completes, the next gateway start requeues that delivery. This is an
+ at-least-once local queue: a delivery may run more than once if the process
+ exits at the wrong time, so external scripts should make repeated trigger
+ messages safe. If the delivery reaches the agent and the agent turn fails, the
+-delivery is marked failed in Automations instead of retrying forever.
++delivery is recorded as failed instead of retrying forever.
+ 
+ For longer or generated content, omit the message argument and pipe stdin:
+ 
+@@ -114,8 +114,9 @@ nanobot trigger --config ./bot-a/config.json trg_8K4P2Q9X "Nightly report"
+ nanobot trigger --workspace ./bot-a/workspace trg_8K4P2Q9X "Nightly report"
+ ```
+ 
+-Manage triggers from the WebUI Automations view. You can search, pause/resume,
+-rename, delete, and copy the trigger command there. A session may have multiple
++Manage triggers by asking nanobot in the linked chat or WebUI topic. You can
++list the triggers for that topic, pause/resume, rename, or delete them, and ask
++nanobot to repeat the trigger command. A session may have multiple
+ triggers, just like it may have multiple scheduled automations.
+ 
+ See [Automations](./automations.md) for how local triggers fit with scheduled
+diff --git a/docs/cli-reference.md b/docs/cli-reference.md
+index 415131a..107748d 100644
+--- a/docs/cli-reference.md
++++ b/docs/cli-reference.md
+@@ -301,15 +301,17 @@ Options:
+ | `nanobot trigger --config <path> <id> "message"` | Use the workspace from a specific config |
+ | `nanobot trigger --workspace <path> <id> "message"` | Use a specific workspace |
+ 
+-Triggers are managed in the WebUI Automations view instead of through separate
+-`list`, `revoke`, or `delete` CLI subcommands. From there you can pause/resume,
+-rename, delete, search, and copy the command for each trigger.
++Triggers are created and managed by asking nanobot in the linked chat or WebUI
++topic, instead of through separate `list`, `revoke`, or `delete` CLI subcommands.
++nanobot replies with the trigger ID and its `nanobot trigger ...` command when
++you create one with `/trigger <name>`; ask in that topic to list, pause/resume,
++rename, or delete the triggers linked to it.
+ 
+ For webhooks or other external systems, run your own small service and have it
+ call this CLI after it decides what message nanobot should receive.
+ 
+-See [Automations](./automations.md) for the broader automation model, WebUI
+-management, and delivery behavior.
++See [Automations](./automations.md) for the broader automation model,
++management through chat, and delivery behavior.
+ 
+ ## OpenAI-Compatible API
+ 
+diff --git a/docs/guides/ai-agent-webui.md b/docs/guides/ai-agent-webui.md
+index 2ea6a4a..56dd6ff 100644
+--- a/docs/guides/ai-agent-webui.md
++++ b/docs/guides/ai-agent-webui.md
+@@ -1,8 +1,7 @@
+ # How to Use an AI Agent WebUI with nanobot
+ 
+ nanobot includes a browser WebUI for persistent chat sessions, visible agent
+-activity, workspace controls, Apps, MCP presets, Skills, settings, and
+-Automations.
++activity, workspace controls, Apps, MCP presets, Skills, and settings.
+ 
+ ## What you will build
+ 
+diff --git a/docs/guides/long-running-ai-agent.md b/docs/guides/long-running-ai-agent.md
+index 4104cfe..2d25468 100644
+--- a/docs/guides/long-running-ai-agent.md
++++ b/docs/guides/long-running-ai-agent.md
+@@ -48,7 +48,8 @@ so nanobot can link it to the correct session and workspace.
+   triggers.
+ - Use stable session keys or chat sessions for work that should preserve context.
+ - Keep goals bounded and explicit about done-ness.
+-- Review Automations in the WebUI before relying on a schedule.
++- Ask nanobot in the target chat to list the automations you rely on before you
++  depend on a schedule.
+ 
+ ## Security notes
+ 
+@@ -61,13 +62,12 @@ so nanobot can link it to the correct session and workspace.
+ - If a goal appears stuck, inspect the active session and gateway logs.
+ - If an automation does not run, check that it is linked to a chat/session and
+   that the gateway is still running.
+-- If a local trigger fails, check the command copied from the WebUI Automations
+-  view.
++- If a local trigger fails, check the `nanobot trigger ...` command nanobot gave
++  you when the trigger was created.
+ 
+ ## Related nanobot docs
+ 
+ - [Automations](../automations.md)
+-- [WebUI Automations](../webui.md#automations)
+ - [Chat Commands](../chat-commands.md)
+ - [Memory](../memory.md)
+ - [Deployment](../deployment.md)
+diff --git a/docs/start-without-technical-background.md b/docs/start-without-technical-background.md
+index 12a8cd2..53428f0 100644
+--- a/docs/start-without-technical-background.md
++++ b/docs/start-without-technical-background.md
+@@ -120,7 +120,7 @@ Do not configure every feature immediately. Choose one next goal:
+ | Add a provider credential | Open **Settings → Models**, then find the provider |
+ | Connect Telegram, Discord, Slack, Feishu, WeChat, or another chat app | Open **Settings → Channels**, choose the platform, and follow its connection steps |
+ | Add a tool integration | Open **Apps** and choose an App or MCP integration |
+-| Schedule a reminder or recurring task | Ask nanobot in the target chat, then manage it in **Automations** |
++| Schedule a reminder or recurring task | Ask nanobot in the target chat to schedule it; ask again in that chat to change or cancel it |
+ | Work with project files | Start a new chat, choose the project workspace, and review the access setting before sending the task |
+ 
+ Repository docs show the current development version. If your stable package does not yet show **Settings → Channels**, use the [Chat Apps guide](./chat-apps.md) or update to a release that includes it.
+diff --git a/docs/webui.md b/docs/webui.md
+index a4a55d5..9c628d9 100644
+--- a/docs/webui.md
++++ b/docs/webui.md
+@@ -1,10 +1,10 @@
+ # Nanobot WebUI: Browser Workbench for Self-Hosted AI Agents
+ 
+-<!-- Meta description: Run nanobot from a browser WebUI with persistent and temporary chats, visible tool activity, workspace controls, Apps, skill discovery, settings, and Automations. -->
++<!-- Meta description: Run nanobot from a browser WebUI with persistent and temporary chats, visible tool activity, workspace controls, Apps, skill discovery, and settings. -->
+ 
+ The WebUI is nanobot's browser workbench for persistent topics, grouped
+ conversation panes, temporary chats, visible agent activity, workspace controls,
+-Apps, skill discovery, settings, and Automations in one place. It shares the
++Apps, skill discovery, and settings in one place. It shares the
+ gateway and saved sessions with the native terminal client.
+ 
+ For a visual tour, see the [README feature gallery](../README.md#-webui).
+@@ -92,7 +92,6 @@ This path avoids hand-editing `config.json` for normal setup. Use the reference
+ | Channels | Connect and validate chat platforms, install their optional support, and manage saved channel setup |
+ | Apps | Install, test, update, and use local CLI App adapters and MCP presets |
+ | Skills | Inspect and manage installed skills, or discover skills from supported marketplaces |
+-| Automations | Review, search, run, pause, edit, and delete scheduled and local-trigger agent turns |
+ | Settings | Adjust models, providers, image generation, voice, web tools, runtime, and safety options |
+ 
+ ## Topic Workspace
+@@ -307,55 +306,12 @@ scripts. Review the source and instructions before installing one, and enable
+ only skills you trust with the same files, tools, and credentials available to
+ your agent.
+ 
+-## Automations
+-
+-Automations are agent turns that run later in a linked topic. Create them from
+-the topic or channel where they are supposed to run so nanobot keeps the
+-correct target context. When an automation runs, it normally delivers the
+-result back to that topic.
+-
+-For the full automation model, creation flow, trigger CLI usage, and delivery
+-semantics, see [`automations.md`](./automations.md).
+-
+-There are two user-facing automation types:
+-
+-- Scheduled automations, created by the agent's cron tool, run at a time,
+-  interval, or cron expression.
+-- Local triggers, created with `/trigger <name>`, run when you call a local
+-  command such as `nanobot trigger trg_8K4P2Q9X "Review PR #4502"`.
+-
+-For recurring background checks that should stay quiet unless there is something
+-useful to report, use the protected heartbeat job by editing `HEARTBEAT.md`
+-instead of creating a chat automation.
+-
+-Use the Automations view to:
+-
+-- Filter by all, active, paused, needs-attention, or system jobs.
+-- Search by task name, message, trigger command, linked topic, schedule, or status.
+-- Sort by next run, last run, updated time, or name.
+-- Run scheduled automations now.
+-- Pause or resume, rename, or delete user-created automations.
+-- Copy the CLI command for local triggers.
+-- Inspect protected system automations without changing them.
+-
+-Search accepts plain text and field filters such as `name:backup`,
+-`chat:WeChat`, `schedule:09:30`, `cron:"0 23 * * *"`, `trigger`, and
+-`status:paused`.
+-
+-An automation without a linked topic cannot be enabled or run from the WebUI,
+-because nanobot would not know where to deliver the scheduled turn. Recreate it
+-from the target topic or channel so the automation has complete context.
+-
+-Local triggers do not have a WebUI "Run now" action because each run needs a
+-message. Use the copied `nanobot trigger ...` command and replace `"message"`
+-with the content that should be delivered.
+-
+ ## Settings
+ 
+ Settings is the control surface for browser-local and gateway-backed
+ runtime configuration. Use it to review or adjust model presets, providers,
+ image generation, voice transcription, web tools, chat channels, Apps,
+-Automations, Skills, runtime identity, and advanced safety controls.
++Skills, runtime identity, and advanced safety controls.
+ 
+ Some settings take effect immediately. Runtime settings that affect the gateway
+ or agent process may require a restart; the WebUI shows that requirement next to

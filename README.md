@@ -16,7 +16,7 @@
 |---|---|---|
 | `desktop/` | ✅ | Tauri 桌面壳（Rust + 前端） |
 | `packaging/` | ✅ | 把 Python 后端冻结成 sidecar 的脚本与 spec |
-| `patches/` | ✅ | 对上游 nanobot 的补丁（**不 fork 上游**） |
+| `patches/` | ✅ | 对上游 nanobot 的补丁（**不 fork 上游**）→ [`patches/README.md`](patches/README.md) |
 | `scripts/` | ✅ | 开发期辅助脚本（恢复上游等） |
 | `docs/` | ✅ | 架构与设计决策记录 |
 | `nanobot-0.3.5/` | ❌ | 上游源码检出，用 `scripts/restore-upstream.ps1` 恢复 |

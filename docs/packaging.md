@@ -1,17 +1,28 @@
 # 打包与分发
 
-> **状态：已实施并实测通过。** 发布形态（Tauri 壳 + 冻结 Python 后端 + NSIS 安装程序）
-> 已构建：`SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**（WebView2 离线安装模式），
-> 未签名。静默安装、升级不丢数据、卸载清理、无控制台启动、已删功能未进包
+> **状态：已实施、已实测、已发布。** 发布形态（Tauri 壳 + 冻结 Python 后端 + NSIS 安装程序）
+> 已构建并公开发布：`SnapBot_0.0.1_x64-setup.exe`，**259.3 MiB**
+> （WebView2 离线安装模式），**未签名**（发布决策，见检查清单最后一条）。
+>
+> ```
+> SHA256 0D438D4D6AD28C2C6A05C05DD19809B0AF1E3CC12DBB7F71DBDFA77948CF199E
+> 下载   https://github.com/Cretaceous-pc/SnapBot/releases/latest
+> ```
+>
+> 静默安装、升级不丢数据、卸载清理、无控制台启动、已删功能未进包
 > 等实测见文末「实测记录」。
 > 本文记录发布形态的取舍，以及**一定会踩的坑**（含踩坑时的症状与验收方法）。
+
+> **版本号说明**：2026-10-16 之前的构建产物名为 `SnapBot_0.1.0_…`（当时的开发版本号）。
+> 首次公开发布时统一改为 **0.0.1**，产物内容一致，仅版本号不同；
+> 文末实测记录里保留各自当时的文件名，未作改写。
 
 ---
 
 ## 目标形态
 
 ```
-SnapBot_0.1.0_x64-setup.exe          ← 一个安装程序，用户双击装完即用
+SnapBot_0.0.1_x64-setup.exe          ← 一个安装程序，用户双击装完即用
   └─ 安装后
      ├─ SnapBot.exe                  ← Tauri 壳（Rust + 系统 WebView2，~10MB）
      ├─ nanobot-backend.exe          ← PyInstaller onedir 冻结的 Python 后端
@@ -282,7 +293,7 @@ Tauri 内置 NSIS 与 MSI(WiX) 两种。选 **NSIS**：不需要额外装 WiX �
 ```powershell
 cd desktop\src-tauri
 cargo tauri build
-# 产物：target\release\bundle\nsis\SnapBot_0.1.0_x64-setup.exe
+# 产物：target\release\bundle\nsis\SnapBot_0.0.1_x64-setup.exe
 ```
 
 ### 3.2 代码签名（发给别人就绕不过去）
@@ -479,7 +490,7 @@ const FORCE_CHINESE_LOCALE_SCRIPT: &str = r#"
 - [x] WebView2 缺失场景已按选定模式处理（已改为 `offlineInstaller`，离线可装）
 - [x] **无控制台双击启动不崩**（见 §1.7，windowed stdio 为 None）
 - [x] 开始菜单有卸载入口（见 §4.2 `NSIS_HOOK_POSTINSTALL`）
-- [ ] 签名与 SmartScreen 表现已实测
+- [x] 代码签名：**已决定不做**（见下方「为什么不签名」）
 
 ### 实测记录（2026-10-16）：安装到含中文与空格的路径
 
@@ -539,6 +550,25 @@ SHA256 8E86A9B0DB2B55B6811FF766AABCE3404750D63D5211EC7BE586A10309D7C1A4
 复测项：静默安装 → 删掉 `~/.nanobot` 后启动（首次运行自愈）→ 把
 `tokenIssueSecret` 置空后启动（超时文案）→ `uninstall.exe /S`。
 结果与详情见 [`auth-flow-analysis.md`](auth-flow-analysis.md) 第七节。
+
+**发布前定版 0.0.1**（同一天）：版本号由 `0.1.0` 改为 **`0.0.1`**
+（`tauri.conf.json` + `Cargo.toml`），重新构建并做了一次**跨版本覆盖安装**实测：
+
+```
+SnapBot_0.0.1_x64-setup.exe   259.3 MiB
+SHA256 0D438D4D6AD28C2C6A05C05DD19809B0AF1E3CC12DBB7F71DBDFA77948CF199E
+```
+
+| 验证项 | 结果 |
+|---|---|
+| 0.1.0 → 0.0.1 覆盖安装 | ✅ 退出码 0，注册表版本变为 `0.0.1`，开始菜单两个快捷方式都在 |
+| **用户数据完整** | ✅ 哨兵文件仍在；`config.json` **SHA256 与升级前逐字节相同**；`tokenIssueSecret` 未变 |
+| 文件数 35 → 34 | ⚠️ 不是丢数据：少的是 `run\snapbot-desktop.json`（壳自己的端口/PID 状态文件）。日志显示这次退出走的是**优雅退出**（`停止由本应用启动的网关`），而退出时清掉该状态文件是设计行为（`gateway::forget_ports`） |
+| 安装后运行 | ✅ `/health` 就绪、WebUI HTTP 200，后端仍取自安装目录 |
+
+> 教训：**用"文件数不变"当验收点会误报**。用户数据的判据应当是
+> 「哨兵文件在 + `config.json` 逐字节相同」，而不是文件总数——`run/`、
+> `llm_usage.sqlite3-wal` 这类瞬时文件本来就会增删。
 
 ### 实测记录（2026-10-12，删除自动任务 + 注销之后）
 
@@ -626,7 +656,27 @@ nsExec::ExecToLog 'wmic process where "name='python.exe' and commandline like '%
 
 改成 `taskkill /IM python.exe /T /F` + PowerShell 命令行过滤解决。
 
-### 未签名的影响（实测）
+### 为什么不签名（发布决策，2026-10-16）
 
-`Get-AuthenticodeSignature` 返回 `NotSigned`。用户首次运行会遇到 Windows
-SmartScreen「未知发布者」提示。**这与壳选型无关**，任何未签名的分发形态都一样。
+**结论：0.0.1 以未签名形式发布。** 这是决策，不是遗漏。
+
+实测表现：`Get-AuthenticodeSignature` 返回 `NotSigned`；用户首次运行会遇到
+Windows SmartScreen「未知发布者」，需要点「更多信息 → 仍要运行」。
+**这与壳选型无关**，任何未签名的分发形态都一样。
+
+权衡：
+
+| | 签名（OV） | 签名（EV） | 不签名（当前选择） |
+|---|---|---|---|
+| 成本 | ≈ $100–300/年 | 更贵，且要过企业身份核验 | **0** |
+| 首启体验 | SmartScreen 提示仍在（信誉要攒） | 立即无提示 | 提示 + 一句"点仍要运行" |
+| 适用 | 公开大规模分发 | 商业发布 | 自己用 + 发给身边人 |
+
+分发对象是自己和身边的人，Release 说明里写清怎么点即可，因此不值得为此付费。
+**将来若要大规模公开分发**，补签名只需在 `cargo tauri build` 之后加一步：
+
+```powershell
+signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /a SnapBot_x.y.z_x64-setup.exe
+```
+
+（Tauri 也支持在 `bundle.windows` 里配置证书自动签名；到时改配置比改脚本更省事。）

@@ -75,3 +75,29 @@ content differs    : 0
 
 2026-10-16 实测即为上述结果（`原档\nanobot-0.3.5.zip` 解包 1471 个文件，
 排除 `.venv`/`node_modules`/`__pycache__`/`nanobot/web/dist`/`uv.lock` 后比对 1460 个）。
+该结果是**从 GitHub 克隆下来的补丁**跑出来的，不是本地副本。
+
+## 换行符：这棵树必须保持 LF
+
+上游整棵树是 LF，本仓库 `.gitattributes` 也声明 `* text=auto eol=lf`。
+2026-10-16 排查发现有两个文件在之前的编辑中变成了 CRLF
+（几乎可以肯定是 PowerShell 的 `Get-Content`/`Set-Content` 写的，它默认写 CRLF）：
+
+```
+nanobot/webui/ws_http.py                                        CRLF=1506
+nanobot/channels/websocket/tests/test_websocket_http_routes.py  CRLF=3413
+```
+
+**症状很隐蔽**：补丁应用出来的结果"看起来"和工作区一样（内容逐行相同），
+但逐字节比对就差这两个文件 —— 差的正是那些 CR。功能上未必立刻出问题，
+但从此没人能回答"这棵树到底是不是补丁描述的那棵树"。
+
+已把这两个文件规范回 LF（`python -m py_compile` 通过），
+现在补丁应用结果与工作区**逐字节一致**。
+
+> ⚠️ 在这个项目里改文件**不要用 PowerShell 的 `Set-Content`/`Out-File`**：
+> 它会写 CRLF，5.1 还会按 GBK 读写中文。用编辑工具，或
+> `[System.IO.File]::WriteAllBytes` 明确控制字节。
+> 同类根因还出过一次更严重的事故：子代理用 PowerShell 改含中文的测试文件，
+> 中文被按 GBK 解码毁成乱码（见 `docs/packaging.md` 的教训段落）。
+

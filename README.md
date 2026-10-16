@@ -61,13 +61,19 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 端口被占自动回退 + 记住实际端口（已实测）
 - [x] 冻结 Python 后端为可分发目录（**120.7 MB**，已实测）
       → [`packaging/`](packaging/)
-- [x] **NSIS 安装程序构建并实测**（`SnapBot_0.1.0_x64-setup.exe`，52.29 MB）
-      → [`docs/packaging.md`](docs/packaging.md)
+- [x] 功能减法：删除「自动任务」UI 与后端路由（**保留 `cron` 引擎与工具**）、
+      删除浏览器端「注销」（保留供应商 OAuth 注销）
+      → [`docs/auth-flow-analysis.md`](docs/auth-flow-analysis.md)
+- [x] **NSIS 安装程序构建并实测**（`SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**，
+      WebView2 离线安装模式）→ [`docs/packaging.md`](docs/packaging.md)
       - **独立运行**：清空全部 `SNAPBOT_*` 环境变量后，后端取自安装目录
-      - **升级不误删用户数据**（哨兵文件验证，39 → 39 文件）
+      - **升级不误删用户数据**（哨兵文件验证，51 → 51 文件）
       - **卸载无残留**：`~/.nanobot` + 安装目录 + 注册表项全部清除
+      - **无控制台双击启动不崩**（windowed 冻结体 stdio 为 `None` 的坑）
+      - **已删功能未进包**：核对 `installer.nsi` 清单，422/422 asset 匹配
+- [x] WebView2 分发策略：`offlineInstaller`（安装包 +127 MB，免掉「装完白屏」）
+- [x] 开始菜单补卸载入口（Tauri 模板只注册注册表项，用户找不到卸载）
 - [ ] 代码签名（当前 `NotSigned`，用户首启会遇到 SmartScreen「未知发布者」）
-- [ ] WebView2 分发策略（当前未显式配置 `webviewInstallMode`）
 - [ ] 安装路径含中文/空格的兼容性测试
 
 > 安装包与构建产物均不入库（`packaging/dist/`、`target/` 已在 `.gitignore`）。

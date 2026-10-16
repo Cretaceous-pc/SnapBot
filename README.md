@@ -5,6 +5,11 @@
 
 面向两种使用者：作者自己日常使用，以及**分发给他人安装**。
 
+> **下载安装包**：[Releases · SnapBot 0.0.1](https://github.com/Cretaceous-pc/SnapBot/releases/latest)
+> —— `SnapBot_0.0.1_x64-setup.exe`（259.3 MiB，per-user 安装，免管理员）。
+> **未签名**，首次运行需在 SmartScreen 里点「仍要运行」；安装与使用说明见
+> [`docs/releases/v0.0.1.md`](docs/releases/v0.0.1.md)。
+
 ---
 
 ## 这个仓库跟踪什么
@@ -68,7 +73,7 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
       不再读一次就退到密码框；超时先给出中文文案再进入。实测首次运行与
       「secret 为空」两条路径**都没有出现密码框**
       → [`docs/auth-flow-analysis.md`](docs/auth-flow-analysis.md) §7
-- [x] **NSIS 安装程序构建并实测**（`SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**，
+- [x] **NSIS 安装程序构建并实测**（`SnapBot_0.0.1_x64-setup.exe`，**259.3 MB**，
       WebView2 离线安装模式）→ [`docs/packaging.md`](docs/packaging.md)
       - **独立运行**：清空全部 `SNAPBOT_*` 环境变量后，后端取自安装目录
       - **升级不误删用户数据**（哨兵文件验证，51 → 51 文件）
@@ -79,7 +84,11 @@ Nanobot.exe  (Tauri 壳, 系统 WebView2)
 - [x] 开始菜单补卸载入口（Tauri 模板只注册注册表项，用户找不到卸载）
 - [x] **安装路径含中文/空格的兼容性**：实测装到 `D:\安装 测试\SnapBot 空格`，
       壳与冻结后端均从该路径启动，`/health` 就绪、WebUI HTTP 200、卸载清理干净
-- [ ] 代码签名（当前 `NotSigned`，用户首启会遇到 SmartScreen「未知发布者」）
+- [x] **代码签名：已决定不做**。当前 `NotSigned`，用户首启会遇到 SmartScreen
+      「未知发布者」。这是**发布决策**不是技术债：证书要钱（OV ≈ $100–300/年，
+      且只有 EV 才能立即建立信誉），而这个应用的分发对象是自己与身边人，
+      在 Release 说明里讲清「点仍要运行」即可。将来真要公开大规模分发，再补
+      签名与时间戳，构建侧只需加一步 `signtool sign`（`docs/packaging.md` 有记）
 
 > 安装包与构建产物均不入库（`packaging/dist/`、`target/` 已在 `.gitignore`）。
 > 重新构建：`.\packaging\build-backend.ps1` → `cd desktop\src-tauri; cargo tauri build`

@@ -23,12 +23,24 @@ const STATE_STARTING: u8 = 0;
 const STATE_READY: u8 = 1;
 const STATE_FAILED: u8 = 2;
 
+/// 等网关写入 `tokenIssueSecret` 的上限。
+///
+/// 首次运行实测约 2 秒就能读到（网关初始化写完 config.json + 生成凭据），
+/// 15 秒是给慢盘/杀软扫描留的余量。**不能设得更短**：超时后会退到
+/// 密码输入页，那正是方案 B 想消掉的体验。
+const SECRET_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 轮询间隔。250ms 是为了让"等到了"这件事在用户察觉不到延迟的前提下尽快发生。
+const SECRET_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 struct Bootstrap {
     state: AtomicU8,
     /// 就绪后前端要加载的 URL
     url: Mutex<String>,
     /// 失败原因（展示给用户）
     error: Mutex<String>,
+    /// 非致命提示（例如始终没等到 tokenIssueSecret）——加载页会显示后再进入
+    warning: Mutex<String>,
     /// 我们起的网关进程；附着模式下为 None
     process: Mutex<Option<gateway::GatewayProcess>>,
     /// 是否处于首次运行引导（前端据此显示不同文案）
@@ -41,6 +53,7 @@ impl Bootstrap {
             state: AtomicU8::new(STATE_STARTING),
             url: Mutex::new(String::new()),
             error: Mutex::new(String::new()),
+            warning: Mutex::new(String::new()),
             process: Mutex::new(None),
             onboarding: Mutex::new(false),
         }
@@ -70,6 +83,7 @@ fn bootstrap_status(app: tauri::AppHandle) -> serde_json::Value {
         "onboarding": *boot.onboarding.lock().unwrap(),
         "url": boot.url.lock().unwrap().clone(),
         "error": boot.error.lock().unwrap().clone(),
+        "warning": boot.warning.lock().unwrap().clone(),
     })
 }
 
@@ -79,6 +93,7 @@ fn bootstrap_retry(app: tauri::AppHandle) {
     let boot = app.state::<Bootstrap>();
     boot.state.store(STATE_STARTING, Ordering::SeqCst);
     *boot.error.lock().unwrap() = String::new();
+    *boot.warning.lock().unwrap() = String::new();
     let handle = app.clone();
     std::thread::spawn(move || run_bootstrap(handle));
 }
@@ -105,7 +120,8 @@ fn run_bootstrap(app: tauri::AppHandle) {
         }
     };
 
-    if cfg.needs_onboarding {
+    let was_onboarding = cfg.needs_onboarding;
+    if was_onboarding {
         gateway::log_line("检测到首次运行：尚无配置文件，交给网关初始化");
         *boot.onboarding.lock().unwrap() = true;
     } else {
@@ -133,21 +149,44 @@ fn run_bootstrap(app: tauri::AppHandle) {
         }
     }
 
-    // ---- 第三步：算 WebUI 地址 ----
+    // ---- 第三步：算 WebUI 地址（必要时等 tokenIssueSecret 出现）----
     //
-    // 必须重新读配置，因为首次运行时 tokenIssueSecret 是上游在这次初始化里
-    // 生成的，第一步拿到的只是占位值（secret 为空），用它开窗会连不上后端。
-    if cfg.needs_onboarding {
-        match config::load() {
-            Ok(fresh) => cfg = fresh,
-            Err(err) => {
-                boot.set_failed(format!(
-                    "网关已启动，但重新读取配置失败：{err}\n\
-                     请检查 ~/.nanobot/config.json 是否被正确写入。"
+    // `tokenIssueSecret` 是网关初始化时写进 config.json 的：
+    //   · 首次运行时它和配置文件一起生成（第一步读到的只是占位值）；
+    //   · 配置已存在但 secret 为空时，也可能稍后才补齐。
+    // 所以这里**轮询等待**，而不是读一次就认命 —— 只读一次会把用户挡在一个
+    // 本可自动填好的密码框前面。这是「方案 B」，分析见 docs/auth-flow-analysis.md。
+    //
+    // 常规启动（secret 本来就在）不会进入这个分支，零额外耗时。
+    if cfg.secret.is_empty() {
+        let started = std::time::Instant::now();
+        match config::wait_for_secret(SECRET_WAIT_TIMEOUT, SECRET_WAIT_INTERVAL, config::load) {
+            Ok(fresh) => {
+                cfg = fresh;
+                gateway::log_line(&format!(
+                    "已等到网关写入 tokenIssueSecret（耗时 {} ms）",
+                    started.elapsed().as_millis()
                 ));
-                return;
+            }
+            Err(outcome) => {
+                if let Some(last) = outcome.last {
+                    cfg = last;
+                }
+                let note = format!(
+                    "等待 {} 秒（{} 次读取）仍未读到 tokenIssueSecret。\n\
+                     将以无凭据方式打开界面：若界面要求输入密码，说明网关要求凭据。\n\
+                     请检查 {} 里的 channels.websocket.tokenIssueSecret。",
+                    outcome.waited.as_secs(),
+                    outcome.attempts,
+                    cfg.config_path.display()
+                );
+                gateway::log_line(&note);
+                *boot.warning.lock().unwrap() = note;
             }
         }
+    }
+
+    if was_onboarding {
         gateway::log_line(&format!(
             "首次运行完成：WebUI 端口 {}，凭据 {}",
             plan.webui,
@@ -337,5 +376,19 @@ mod tests {
         let script = locale_script();
         assert!(script.contains("setItem"));
         assert!(!script.contains("getItem"));
+    }
+
+    /// 等 secret 的超时必须"比网关初始化慢"，否则方案 B 会在首次运行上失效：
+    /// 超时 → 落到密码框 → 用户被要求手输一个本可自动读取的密码。
+    #[test]
+    fn secret_wait_timeout_is_generous_enough_for_first_run() {
+        assert!(
+            SECRET_WAIT_TIMEOUT >= std::time::Duration::from_secs(10),
+            "首次运行初始化要数秒，超时不能低于 10 秒（当前 {SECRET_WAIT_TIMEOUT:?}）"
+        );
+        assert!(
+            !SECRET_WAIT_INTERVAL.is_zero() && SECRET_WAIT_INTERVAL <= std::time::Duration::from_millis(500),
+            "轮询间隔应在 1..=500ms（当前 {SECRET_WAIT_INTERVAL:?}）"
+        );
     }
 }

@@ -7,6 +7,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -186,10 +187,55 @@ pub fn load() -> Result<GatewayConfig, String> {
     })
 }
 
+/// 等 `tokenIssueSecret` 出现的结果（超时路径用）。
+#[derive(Debug)]
+pub struct SecretWaitOutcome {
+    /// 最后一次成功读到的配置。超时后调用方应当拿它继续往下走，
+    /// 而不是丢掉它——里面的端口、`websocket_enabled` 仍然是有用的。
+    pub last: Option<GatewayConfig>,
+    pub attempts: u32,
+    pub waited: Duration,
+}
+
+/// 轮询等待配置里的 `tokenIssueSecret` 出现。
+///
+/// 为什么需要轮询而不是读一次：`tokenIssueSecret` 是**网关初始化时写进
+/// `config.json`** 的。首次运行时它和配置文件一起生成；配置文件已存在但
+/// secret 为空（用户手工清过、或上游改了写入时机）时也可能稍后才补齐。
+/// 只读一次就会漏掉这个窗口，结果是把用户挡在一个**本可自动填好**的
+/// 密码框前面——那正是「方案 B」要消掉的东西（见 `docs/auth-flow-analysis.md`）。
+///
+/// `load` 作为参数传入而不是直接调用 `load()`，是为了让测试能注入脚本化的
+/// 读取序列（真实实现传 [`load`]）。
+pub fn wait_for_secret(
+    timeout: Duration,
+    interval: Duration,
+    mut load: impl FnMut() -> Result<GatewayConfig, String>,
+) -> Result<GatewayConfig, SecretWaitOutcome> {
+    let started = Instant::now();
+    let mut attempts: u32 = 0;
+    let mut last: Option<GatewayConfig> = None;
+
+    loop {
+        attempts += 1;
+        match load() {
+            // 空 secret 不算「读到了」：没有它照样会落到密码框
+            Ok(cfg) if !cfg.secret.is_empty() => return Ok(cfg),
+            Ok(cfg) => last = Some(cfg),
+            Err(_) => {}
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(SecretWaitOutcome { last, attempts, waited: started.elapsed() });
+        }
+        std::thread::sleep(interval.min(remaining));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// 测试用基准配置：只覆盖关心的字段，避免每加一个字段就要改三处测试。
     fn sample(secret: &str) -> GatewayConfig {
         GatewayConfig {
@@ -238,5 +284,64 @@ mod tests {
         assert_eq!(cfg.webui_port, 8765);
         assert_eq!(cfg.health_port, 18790);
         assert!(cfg.websocket_enabled);
+    }
+
+    // ---- 方案 B：等待 tokenIssueSecret ----
+
+    /// 脚本化的配置读取：按顺序吐出预设的 secret，用完后一直吐最后一个。
+    fn scripted(secrets: Vec<&'static str>) -> impl FnMut() -> Result<GatewayConfig, String> {
+        let mut idx = 0usize;
+        move || {
+            let secret = secrets[idx.min(secrets.len() - 1)];
+            idx += 1;
+            Ok(sample(secret))
+        }
+    }
+
+    /// secret 已经存在时不该有任何等待与重试（常规启动路径零开销）。
+    #[test]
+    fn wait_for_secret_returns_immediately_when_present() {
+        let outcome = wait_for_secret(Duration::from_secs(5), Duration::ZERO, scripted(vec!["s1"]));
+        let cfg = outcome.expect("secret 已存在时应当立即成功");
+        assert_eq!(cfg.secret, "s1");
+    }
+
+    /// 核心修复：secret 晚一步出现（首次运行就是这样）也必须等到，
+    /// 而不是让用户去手输。这是方案 B 与旧实现的差别所在。
+    #[test]
+    fn wait_for_secret_waits_until_secret_appears() {
+        let seen = std::cell::Cell::new(0u32);
+        let loader = {
+            let seen = &seen;
+            move || {
+                seen.set(seen.get() + 1);
+                // 前两次读到的还是空 secret，第三次才拿到
+                Ok(sample(if seen.get() >= 3 { "late-secret" } else { "" }))
+            }
+        };
+        let cfg = wait_for_secret(Duration::from_secs(5), Duration::ZERO, loader)
+            .expect("第三次应当读到 secret");
+        assert_eq!(cfg.secret, "late-secret");
+        assert_eq!(seen.get(), 3, "应当恰好轮询到出现为止");
+    }
+
+    /// 文件一直不存在（读取报错）也不能 panic，应当超时并交出 last=None。
+    #[test]
+    fn wait_for_secret_times_out_on_persistent_errors() {
+        let err = wait_for_secret(Duration::ZERO, Duration::ZERO, || Err("no config".to_string()))
+            .expect_err("持续读不到配置应当超时");
+        assert!(err.last.is_none());
+        assert_eq!(err.attempts, 1, "零超时只应尝试一次");
+    }
+
+    /// 超时必须把最后一次读到的配置交出来：里面的端口与 websocket 开关
+    /// 仍然是继续启动所必需的，丢掉它会让整个引导失败在无关的地方。
+    #[test]
+    fn wait_for_secret_hands_back_last_config_on_timeout() {
+        let err = wait_for_secret(Duration::ZERO, Duration::ZERO, scripted(vec![""]))
+            .expect_err("secret 一直为空应当超时");
+        let last = err.last.expect("超时也要交出最后一次读到的配置");
+        assert!(last.secret.is_empty());
+        assert_eq!(last.webui_port, 8765);
     }
 }

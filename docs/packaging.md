@@ -527,6 +527,19 @@ SHA256 `DEE5116E236170E8A6E5D2CA7C08948CABCD6E1637A5E6DEA0090BD444849845`）。
 - 结论：非 ASCII 路径**不是**风险点 —— 壳、冻结后端、Python 的
   `sys.executable`、WebView2 用户数据目录在这一路径下都工作正常。
 
+**同日稍后：因「认证自愈（方案 B）」重新构建并复测**
+
+改的是壳的启动时序（`config.rs` / `main.rs` / 加载页），**冻结后端未动**，
+因此只重跑了 `cargo tauri build`。新产物同样 259.3 MiB、安装后仍 130.6 MB：
+
+```
+SHA256 8E86A9B0DB2B55B6811FF766AABCE3404750D63D5211EC7BE586A10309D7C1A4
+```
+
+复测项：静默安装 → 删掉 `~/.nanobot` 后启动（首次运行自愈）→ 把
+`tokenIssueSecret` 置空后启动（超时文案）→ `uninstall.exe /S`。
+结果与详情见 [`auth-flow-analysis.md`](auth-flow-analysis.md) 第七节。
+
 ### 实测记录（2026-10-12，删除自动任务 + 注销之后）
 
 安装包 `SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**，**未签名**。

@@ -42,6 +42,14 @@
     white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
   }
   .err.show { display: block; }
+  /* 非致命提示：能进去，但用户需要知道发生了什么（例如没读到网关凭据） */
+  .warn {
+    display: none; margin-top: 22px; padding: 14px 16px; text-align: left;
+    background: rgba(255, 196, 92, .10); border: 1px solid rgba(255, 196, 92, .34);
+    border-radius: 12px; color: #ffe2ac; font-size: 13px;
+    white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
+  }
+  .warn.show { display: block; }
   button {
     display: none; margin: 18px auto 0; padding: 9px 26px; cursor: pointer;
     border: 0; border-radius: 9px; font-size: 14px; color: #06121f;
@@ -58,7 +66,9 @@
     <p id="msg">正在启动本地服务…</p>
     <div class="bar" id="bar"><i></i></div>
     <div class="err" id="err"></div>
+    <div class="warn" id="warn"></div>
     <button id="retry">重试</button>
+    <button id="enter">立即进入</button>
   </div>
 
 <script>
@@ -67,8 +77,12 @@
   var bar   = document.getElementById('bar');
   var err   = document.getElementById('err');
   var retry = document.getElementById('retry');
+  var warn  = document.getElementById('warn');
+  var enter = document.getElementById('enter');
   var started = Date.now();
   var sawOnboarding = false;
+  var warned = false;
+  var warnTimer = null;
 
   function invoke(cmd) {
     var g = window.__TAURI__;
@@ -109,10 +123,9 @@
       if (s.onboarding) sawOnboarding = true;
       if (s.failed) { fail(s.error || '未知错误'); return; }
       if (s.ready && s.url) {
-        msg.textContent = sawOnboarding
-          ? '初始化完成，正在打开界面…（随后请在 Settings → Models 里配置模型）'
-          : '正在打开界面…';
-        window.location.replace(s.url);
+        // 非致命提示：先讲清楚再进，否则用户会一脸茫然地看到密码框
+        if (s.warning && !warned) { showWarning(s.warning, s.url); return; }
+        navigate(s.url);
         return;
       }
       progress();
@@ -122,10 +135,52 @@
     });
   }
 
+  var warned = false;
+  var warnTimer = null;
+
+  function navigate(url) {
+    msg.textContent = sawOnboarding
+      ? '初始化完成，正在打开界面…（随后请在 Settings → Models 里配置模型）'
+      : '正在打开界面…';
+    window.location.replace(url);
+  }
+
+  function showWarning(text, url) {
+    warned = true;
+    bar.style.display = 'none';
+    msg.textContent = '即将进入界面，但有一件事需要你知道';
+    warn.textContent = text;
+    warn.classList.add('show');
+    enter.classList.add('show');
+
+    var left = 10;
+    enter.textContent = '立即进入（' + left + '）';
+    enter.disabled = true;
+    warnTimer = setInterval(function () {
+      left -= 1;
+      if (left <= 0) {
+        clearInterval(warnTimer);
+        navigate(url);
+        return;
+      }
+      enter.textContent = '立即进入（' + left + '）';
+    }, 1000);
+    setTimeout(function () { enter.disabled = false; }, 1200);
+
+    enter.addEventListener('click', function () {
+      if (warnTimer) clearInterval(warnTimer);
+      navigate(url);
+    });
+  }
+
   retry.addEventListener('click', function () {
     retry.disabled = true;
     err.classList.remove('show');
+    warn.classList.remove('show');
+    if (warnTimer) { clearInterval(warnTimer); warnTimer = null; }
+    warned = false;
     retry.classList.remove('show');
+    enter.classList.remove('show');
     bar.style.display = '';
     msg.textContent = '正在重试…';
     started = Date.now();

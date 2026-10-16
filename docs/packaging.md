@@ -1,8 +1,10 @@
 # 打包与分发
 
-> **状态：设计稿，尚未实施。** 桌面壳的开发期形态（直连 `.venv`）已跑通并验证，
-> 本文记录发布形态要做什么、以及哪些地方一定会踩坑。
-> 按既定节奏：**先把开发形态跑顺，最后才碰打包。**
+> **状态：已实施并实测通过。** 发布形态（Tauri 壳 + 冻结 Python 后端 + NSIS 安装程序）
+> 已构建：`SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**（WebView2 离线安装模式），
+> 未签名。静默安装、升级不丢数据、卸载清理、无控制台启动、已删功能未进包
+> 等实测见文末「实测记录」。
+> 本文记录发布形态的取舍，以及**一定会踩的坑**（含踩坑时的症状与验收方法）。
 
 ---
 
@@ -134,6 +136,55 @@ module_collection_mode={
 > （`nanobot/config/paths.py`）。做隔离测试要用 `--config` 指向临时目录，
 > 不要指望环境变量。
 
+### 1.7 windowed 冻结体的 stdio 是 None（会导致直接双击运行就崩）
+
+`snapbot-backend.spec` 里 `console=False`（桌面应用不要黑窗），
+这让 exe 变成 **GUI 子系统**（PE `Subsystem=2`）。代价是：
+**没有控制台时**（双击、或被 shell 以 `UseShellExecute=true` 拉起），
+PyInstaller 把 `sys.stdout` / `sys.stderr` / `sys.stdin` 置为 **None**。
+
+上游 `nanobot/cli/entry.py::_configure_windows_console()` 第一句是：
+
+```python
+if sys.platform != "win32" or sys.stdout.encoding == "utf-8":
+```
+
+`sys.stdout` 为 None 时取 `.encoding` 直接抛：
+
+```
+AttributeError: 'NoneType' object has no attribute 'encoding'
+```
+
+而且因为是 GUI 子系统，**没有 stderr 可写，traceback 连打都打不出来** ——
+表现为「双击毫无反应 / 一闪而过」。
+
+症状对比（实测）：
+
+| 启动方式 | 修复前 | 修复后 |
+|---|---|---|
+| 控制台里运行（stdout 重定向到文件/管道） | ✅ 正常，打印 `nanobot v0.3.5` | ✅ 正常 |
+| **双击 / `UseShellExecute`（无控制台）** | ❌ 立即死亡，退出码为空 | ✅ 退出码 0 |
+
+**修法（已实施，在 `packaging/backend_entry.py`）**：入口处先补齐占位 stdio。
+
+```python
+class _NullTextStream(io.StringIO):
+    encoding = "utf-8"      # 必须在类层面声明！
+    errors = "replace"
+
+def _ensure_std_streams() -> None:
+    for name in ("stdout", "stderr", "stdin"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, _NullTextStream())
+```
+
+**踩坑记录**：最初写成先 `io.StringIO()` 再实例赋值 `.encoding`，
+运行时报
+`AttributeError: attribute 'encoding' of '_io._TextIOBase' objects is not writable`
+—— C 实现里该属性只读，**必须用子类在类层面声明**。
+
+只替换为 None 的流：有真实控制台时保持原样，不影响正常输出。
+
 ---
 
 ## 第二部分：Tauri 侧
@@ -182,11 +233,42 @@ Win11 自带；Win10 不一定有。Tauri 的选项：
 |---|---|
 | `downloadBootstrapper` | 安装包小，但安装时需要联网 |
 | `embedBootstrapper` | 安装包 +1.8MB，仍需联网 |
-| `offlineInstaller` | 安装包 +127MB，离线可装 |
+| **`offlineInstaller`（已选）** | 安装包 +127MB，离线可装 |
 | `skip` | 最小，但用户可能打不开（白屏） |
 
-面向不确定的他人机器，建议 **`offlineInstaller`**：多 127MB 换掉一整类
-「装完打开是白屏」的客服问题。
+面向不确定的他人机器，已改用 **`offlineInstaller`**：多 127MB 换掉一整类
+「装完打开是白屏」的客服问题。代价是安装包从 52MB 涨到 **259MB**
+（安装后占用仍是 130.6MB，不受影响）。
+
+### 2.3.1 必须在打包前清掉 Tauri 的 staging 副本
+
+**这是一个会静默产出「僵尸文件」的坑。** `cargo tauri build` 把
+`bundle.resources` **复制进** `target/release/nanobot-backend`，
+但**不会**删除源里已不存在的文件。Vite 产出的是内容哈希文件名，
+所以 WebUI 每次重建都会生成**新文件名**，旧文件全部残留：
+
+```
+症状：staging/assets 文件数 > 源 dist 文件数（实测 473 vs 422）
+      index.html 指向新 chunk，但旧 chunk 仍躺在磁盘上
+后果：安装包把新旧两套都打进去。旧 chunk 里可能仍含**已删除的功能代码**
+```
+
+实测：某次打包后旧 `SettingsView-Ca2xn6SF.js` 仍被收进安装包，
+里面就是已删除的自动任务界面。因为 `index.html` 指向新 chunk，**运行起来
+完全正常**，只有拆开安装包才能发现——所以这个坑不会自己暴露。
+
+**修法**：`build-backend.ps1` 在构建前强制删除 staging 副本
+（`target/release/nanobot-backend`），让下一次 `tauri build` 从干净状态复制。
+
+**验收方法**（不要只看「装完能用」）：解压/检查生成的
+`target/release/nsis/x64/installer.nsi`，它含有完整打包清单：
+
+```powershell
+# 打包的 asset 行数应 = 源文件数 x 2
+(Select-String -Path installer.nsi -Pattern 'web\\dist\\assets\\' -AllMatches).Count
+# 逐个核对源文件名是否都在清单里，且没有多余的旧文件名
+```
+
 
 ---
 
@@ -290,15 +372,27 @@ Windows 上即 `%USERPROFILE%`），**根本不在上面两个路径里**：
 }
 ```
 
-`desktop/src-tauri/installer-hooks.nsh` 挂两个宏：
+`desktop/src-tauri/installer-hooks.nsh` 挂三个宏：
 
+- **`NSIS_HOOK_POSTINSTALL`**（新增）
+  - 补一个开始菜单的「**SnapBot 卸载**」快捷方式，指向 `$INSTDIR\uninstall.exe`
+  - **为什么需要**：Tauri 模板**只**把卸载程序注册进
+    `HKCU\...\Uninstall\SnapBot`，也就是说卸载入口只在
+    「设置 → 应用」或安装目录里。开始菜单**只有启动快捷方式**，
+    实测用户会找不到卸载入口。
 - **`NSIS_HOOK_PREUNINSTALL`**
   - `StrCpy $DeleteAppDataCheckboxState 1` —— 默认按「已勾选删除数据」处理
   - 停掉后端进程树（`taskkill /T`）；否则文件被占用会删不干净
   - 顺带清理开发形态遗留的 `nanobot gateway --background` 进程
 - **`NSIS_HOOK_POSTUNINSTALL`**
+  - 显式删除上面补的「SnapBot 卸载」快捷方式
   - 逐项 `RmDir /r` 删 `$PROFILE\.nanobot` 下的子目录，最后整体再删一次
   - **必须判断 `$UpdateMode <> 1`**：升级覆盖安装时绝不能删用户数据
+
+> ⚠️ **测试卸载前务必备份 `~/.nanobot`。** 卸载程序的「删除应用程序数据」
+> **默认勾选**（这是刻意的设计：卸载不留残留），意味着
+> `uninstall.exe /S` 会**连同 `config.json`（含 API key）和会话历史一起删掉**，
+> 且不进回收站。做卸载实测前先复制一份。
 
 三个关键实现细节：
 
@@ -381,9 +475,45 @@ const FORCE_CHINESE_LOCALE_SCRIPT: &str = r#"
 - [x] 卸载时若网关正在运行，进程被停掉且数据仍能删净
 - [x] 安装程序界面为中文（`languages: [SimpChinese, English]`）
 - [x] 安装到用户目录（`%LOCALAPPDATA%`，per-user，无需管理员）
-- [ ] 安装到含中文/空格的路径下能正常工作
-- [ ] WebView2 缺失场景已按选定模式处理（当前未显式配置 `webviewInstallMode`）
+- [x] 安装到含中文/空格的路径下能正常工作
+- [x] WebView2 缺失场景已按选定模式处理（已改为 `offlineInstaller`，离线可装）
+- [x] **无控制台双击启动不崩**（见 §1.7，windowed stdio 为 None）
+- [x] 开始菜单有卸载入口（见 §4.2 `NSIS_HOOK_POSTINSTALL`）
 - [ ] 签名与 SmartScreen 表现已实测
+
+### 实测记录（2026-10-12，删除自动任务 + 注销之后）
+
+安装包 `SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**，**未签名**。
+（体积上涨来自 WebView2 `offlineInstaller`；安装后占用仍是 130.6 MB。）
+
+| 验证项 | 方法 | 结果 |
+|---|---|---|
+| 冻结后端 | `build-backend.ps1 -Clean` | ✅ 120.9 MB，两个冒烟测试通过 |
+| 工具与渠道 | 冻结网关启动日志 | ✅ `Registered 23 tools`（含 `cron`）、`Channels enabled: websocket` |
+| 已删功能未进包 | 检查 staging + `installer.nsi` 清单 | ✅ 0 处残留，422/422 asset 全部匹配 |
+| 安装 | `setup.exe /S` | ✅ 退出码 0，注册为 `SnapBot 0.1.0`，per-user |
+| **升级不丢数据** | 安装前后统计 `~/.nanobot` | ✅ 51 → 51 文件，`config.json` 完好 |
+| **独立运行** | 启动安装后的 exe，探测 `/health` | ✅ 2s 内 `ready: true, websocket: running` |
+| 进程来源 | 检查 `nanobot-backend` 路径 | ✅ 取自安装目录，非开发目录 |
+| **运行时功能核对** | 抓取线上 `index-C4M0V8oW.js` 并正则比对 | ✅ 删除项 0 命中；保留项（`create_automation`、locale 注入、bootstrapSecret）均在 |
+| **无控制台启动**（stdin/stdout 为 None） | `Process.Start` + `CreateNoWindow`，无重定向 | ✅ 退出码 0（修复前：立即死亡、退出码为空） |
+| 有控制台启动 | stdout 重定向到文件 | ✅ 正常打印 `nanobot v0.3.5` |
+| `-m nanobot` 自举翻译 | 同上，无控制台 | ✅ 退出码 0 |
+| **开始菜单卸载入口** | 安装后检查 `$SMPROGRAMS` | ✅ `SnapBot 卸载.lnk` 已创建且指向 `uninstall.exe` |
+| 卸载清理 | `uninstall.exe /S` | ✅ 安装目录 + `~/.nanobot` 全部删除（**默认勾选删数据**） |
+
+**教训**：
+1. 验证「已删功能没进包」不能只看应用能跑起来。由于 `index.html`
+   始终指向最新的 hash chunk，陈旧 chunk 即使被打进安装包也不会影响运行，
+   必须直接核对 `installer.nsi` 的打包清单。
+2. **测卸载前必须先备份 `~/.nanobot`**。这次实测卸载顺带删掉了真实的
+   `config.json`（含 API key）与会话历史 —— 卸载器默认勾选「删除应用程序数据」，
+   这是设计如此，不是 bug。**但测试流程必须自己先备份。**
+3. windowed 冻结体的启动路径**必须单独测无控制台场景**。
+   在控制台里跑一切正常，双击却直接崩，且 GUI 子系统没有 stderr、
+   连 traceback 都看不到。见 §1.7。
+
+
 
 ### 实测记录（2026-10-11）
 

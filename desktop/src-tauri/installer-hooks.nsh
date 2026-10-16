@@ -29,6 +29,27 @@
 ; ----------------------------------------------------------------------------
 
 ; ----------------------------------------------------------------------------
+;  安装后：补一个「卸载」开始菜单快捷方式
+;
+;  为什么需要：Tauri 的 NSIS 模板**只**注册到
+;      HKCU\...\Uninstall\${PRODUCTNAME}
+;  也就是说卸载程序只能从「设置 → 应用」或直接进安装目录找到，
+;  开始菜单里只有启动快捷方式 **SnapBot.lnk**。
+;  实测用户会在开始菜单里找不到卸载入口 —— 这里补上。
+;
+;  细节：
+;    - 快捷方式指向安装目录里的 uninstall.exe（由模板生成）。
+;    - 必须在 POSTINSTALL（安装完成后）创建，此时 uninstall.exe 已落地。
+;    - 用 CreateShortCut，并且 SetShellVarContext current，
+;      保证写进**当前用户**的开始菜单（per-user 安装，无需管理员）。
+;    - 卸载时由模板自己清理开始菜单目录，这里不用额外删。
+; ----------------------------------------------------------------------------
+!macro NSIS_HOOK_POSTINSTALL
+  SetShellVarContext current
+  CreateShortCut "$SMPROGRAMS\${PRODUCTNAME} 卸载.lnk" "$INSTDIR\uninstall.exe" "" "$INSTDIR\uninstall.exe" 0
+!macroend
+
+; ----------------------------------------------------------------------------
 ;  卸载前：停掉进程 + 把「删除应用程序数据」默认置为勾选
 ;
 ;  关于默认勾选：需求是「卸载不留残留」，所以默认应为干净卸载；同时保留
@@ -53,6 +74,12 @@
 !macroend
 
 !macro NSIS_HOOK_POSTUNINSTALL
+  ; 我们自己在 POSTINSTALL 里补的「卸载」快捷方式，这里显式删掉。
+  ; 模板通常也会清空 $SMPROGRAMS 下自己的目录，但显式删除更稳
+  ; （升级路径下不会误删：升级不执行 POSTUNINSTALL 的目录清理语义）。
+  SetShellVarContext current
+  Delete "$SMPROGRAMS\${PRODUCTNAME} 卸载.lnk"
+
   ; 注意：必须判断 $UpdateMode —— 升级时不能删用户数据，
   ; 否则每次覆盖安装都会抹掉配置与会话历史。
   ${If} $DeleteAppDataCheckboxState = 1

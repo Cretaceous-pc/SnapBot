@@ -89,8 +89,21 @@ if (-not $SkipPyInstallerInstall) {
     }
     if (-not $hasPyInstaller) {
         Write-Step "Installing PyInstaller into the venv"
-        & uv pip install --python $VenvPython pyinstaller
-        if ($LASTEXITCODE -ne 0) { throw "PyInstaller install failed" }
+        # Same trap as the PyInstaller run below: uv writes its progress
+        # ("Using Python ... environment at: ...") to STDERR, and under
+        # $ErrorActionPreference='Stop' any native stderr output becomes a
+        # NativeCommandError that TERMINATES the script -- so the install
+        # "fails" before it even starts. Relax the preference locally and
+        # judge success by exit code only.
+        $prevInstall = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & uv pip install --python $VenvPython pyinstaller
+            $pipExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevInstall
+        }
+        if ($pipExit -ne 0) { throw "PyInstaller install failed (exit $pipExit)" }
     } else {
         Write-Host "PyInstaller already available."
     }
@@ -101,6 +114,22 @@ if ($Clean) {
     foreach ($d in @($DistDir, $WorkDir)) {
         if (Test-Path $d) { Write-Step "Removing $d"; Remove-Item $d -Recurse -Force }
     }
+}
+
+# ------------------------------------------------- clean Tauri staging copy
+# Why this matters: `cargo tauri build` copies bundle.resources INTO
+# desktop/src-tauri/target/release/nanobot-backend and does NOT prune files
+# that are no longer in the source. Vite emits content-hashed chunk names, so
+# every WebUI rebuild produces NEW asset filenames and leaves the previous
+# ones behind -- the installer then ships both, including dead chunks that may
+# still contain removed features. Symptom: staged/assets has MORE files than
+# the source dist (e.g. 473 vs 422), and index.html points at the new chunk
+# while the old one lingers on disk.
+# Fix: always drop the staging copy so the next tauri build packs a clean tree.
+$Staging = Join-Path $Root 'desktop\src-tauri\target\release\nanobot-backend'
+if (Test-Path $Staging) {
+    Write-Step "Removing stale Tauri staging copy: $Staging"
+    Remove-Item -LiteralPath $Staging -Recurse -Force
 }
 
 # ---------------------------------------------------------------- build

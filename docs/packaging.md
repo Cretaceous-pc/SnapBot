@@ -475,11 +475,57 @@ const FORCE_CHINESE_LOCALE_SCRIPT: &str = r#"
 - [x] 卸载时若网关正在运行，进程被停掉且数据仍能删净
 - [x] 安装程序界面为中文（`languages: [SimpChinese, English]`）
 - [x] 安装到用户目录（`%LOCALAPPDATA%`，per-user，无需管理员）
-- [x] 安装到含中文/空格的路径下能正常工作
+- [x] 安装到含中文/空格的路径下能正常工作 → 2026-10-16 实测通过（见下）
 - [x] WebView2 缺失场景已按选定模式处理（已改为 `offlineInstaller`，离线可装）
 - [x] **无控制台双击启动不崩**（见 §1.7，windowed stdio 为 None）
 - [x] 开始菜单有卸载入口（见 §4.2 `NSIS_HOOK_POSTINSTALL`）
 - [ ] 签名与 SmartScreen 表现已实测
+
+### 实测记录（2026-10-16）：安装到含中文与空格的路径
+
+被测对象仍是 `SnapBot_0.1.0_x64-setup.exe`（259.3 MB，
+SHA256 `DEE5116E236170E8A6E5D2CA7C08948CABCD6E1637A5E6DEA0090BD444849845`）。
+安装到 **`D:\安装 测试\SnapBot 空格`**（同时含中文与空格），全程未设任何 `SNAPBOT_*` 环境变量。
+
+**方法（两处必须踩准，否则测的不是这件事）**
+
+1. **`/D=` 必须最后一个参数、且不能加引号**。NSIS 的规定是「路径里即使有空格也不要加引号，
+   加引号会把引号本身当成路径的一部分」。所以不能用 PowerShell 的
+   `& $exe /S /D=$dir`（它会给含空格的参数补引号），要用：
+   ```powershell
+   $psi = New-Object System.Diagnostics.ProcessStartInfo
+   $psi.FileName  = $exe
+   $psi.Arguments = '/S /D=' + $dir      # 原样传递，不引号
+   $psi.UseShellExecute = $false
+   [System.Diagnostics.Process]::Start($psi).WaitForExit()
+   ```
+2. **测试脚本正文里不要出现中文**。本机 `powershell.exe` 是 5.1，读无 BOM 的 `.ps1`
+   时按 GBK 解码，中文字面量会把字符串引号吃掉（历史上已被这个坑咬过两次：
+   `.cmd` 与 `.ps1`）。这里的路径用码点拼出来：
+   ```powershell
+   $dir = 'D:\' + [char]0x5B89 + [char]0x88C5 + ' ' + [char]0x6D4B + [char]0x8BD5 + '\SnapBot ' + [char]0x7A7A + [char]0x683C
+   #           安                装            空格            测                试                空格   空                格
+   ```
+
+| 验证项 | 结果 |
+|---|---|
+| 静默安装 | ✅ 退出码 0 |
+| 安装目录落地 | ✅ `D:\安装 测试\SnapBot 空格`（壳 10.0 MB + `uninstall.exe` + `nanobot-backend\`） |
+| 注册表 | ✅ `SnapBot 0.1.0`，`InstallLocation = "D:\安装 测试\SnapBot 空格"` |
+| 开始菜单 | ✅ `SnapBot.lnk` + `SnapBot 卸载.lnk` |
+| **真正跑起来** | ✅ 壳与后端进程路径都在中文目录下：<br>`"D:\安装 测试\SnapBot 空格\nanobot-backend\nanobot-backend.exe" -m nanobot gateway --foreground --port 18790` |
+| 网关就绪 | ✅ `/health` → `{"status":"ok","ready":true,"websocket":"running"}` |
+| WebUI | ✅ `http://127.0.0.1:8765/` HTTP 200，7498 字节 |
+| 工具注册 | ✅ 日志含 23 个工具与 `Channels enabled: websocket` |
+| 首次引导 | ✅ `~/.nanobot` 正常生成，`tokenIssueSecret` 已写入（无 provider key，符合预期） |
+| **卸载清理** | ✅ 安装目录、注册表项、开始菜单、`~/.nanobot`、进程、端口**全部干净** |
+
+**两点说明**
+
+- 安装器只删除自己的 `$INSTDIR`，**不会删上级目录**：测试后 `D:\安装 测试\`
+  会作为空目录留下，需要手工清理。这不是残留问题（里面没有任何文件）。
+- 结论：非 ASCII 路径**不是**风险点 —— 壳、冻结后端、Python 的
+  `sys.executable`、WebView2 用户数据目录在这一路径下都工作正常。
 
 ### 实测记录（2026-10-12，删除自动任务 + 注销之后）
 

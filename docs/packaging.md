@@ -570,6 +570,16 @@ SHA256 0D438D4D6AD28C2C6A05C05DD19809B0AF1E3CC12DBB7F71DBDFA77948CF199E
 > 「哨兵文件在 + `config.json` 逐字节相同」，而不是文件总数——`run/`、
 > `llm_usage.sqlite3-wal` 这类瞬时文件本来就会增删。
 
+**已发布**：[GitHub Release v0.0.1](https://github.com/Cretaceous-pc/SnapBot/releases/tag/v0.0.1)，
+附件就是上面这个安装包。GitHub 记录的附件摘要与本地一致，可作为分发完整性依据：
+
+```
+asset   SnapBot_0.0.1_x64-setup.exe   271940521 bytes   state=uploaded
+digest  sha256:0d438d4d6ad28c2c6a05c05dd19809b0af1e3cc12dbb7f71dbdfa77948cf199e
+```
+
+安装包与构建产物不入库，所以**发布 = 往 Release 挂附件**，而不是往仓库里放二进制。
+
 ### 实测记录（2026-10-12，删除自动任务 + 注销之后）
 
 安装包 `SnapBot_0.1.0_x64-setup.exe`，**259.3 MB**，**未签名**。
